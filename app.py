@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# tapify.py — Notcoin-style Telegram Mini App in a single file with improvements
+# tapify.py — Notcoin-style Telegram Mini App for Render deployment
 # Requirements:
-#   pip install flask python-telegram-bot psycopg[binary] python-dotenv
+#   pip install flask python-telegram-bot psycopg[binary] python-dotenv uvicorn
 #
 # Start:
 #   python tapify.py
@@ -23,14 +23,14 @@ import hmac
 import base64
 import hashlib
 import logging
-import threading
-import time
-import secrets
+import asyncio
 import typing as t
 from urllib.parse import urlparse, parse_qsl, quote_plus
 from datetime import datetime, timedelta, timezone, date
 from collections import deque, defaultdict
 from flask import Flask, request, jsonify, Response
+import uvicorn
+from uvicorn.middleware.wsgi import WSGIMiddleware
 
 # Optional dotenv
 try:
@@ -726,20 +726,6 @@ setInterval(refreshState, 4000);
 def health():
     return Response(INDEX_HEALTH, mimetype="text/plain")
 
-@flask_app.get("/app")
-def app_page():
-    return Response(WEBAPP_HTML, mimetype="text/html")
-
-def _resolve_user_from_init(init_data: str) -> tuple[bool, dict | None, str]:
-    auth = verify_init_data(init_data, BOT_TOKEN)
-    if not auth or not auth.get("user"):
-        return False, None, "Invalid auth"
-    tg_user = auth["user"]
-    chat_id = int(tg_user.get("id"))
-    username = tg_user.get("username")
-    upsert_user_if_missing(chat_id, username)
-    return True, {"chat_id": chat_id, "username": username}, ""
-
 @flask_app.post("/api/auth/resolve")
 def api_auth_resolve():
     data = request.get_json(silent=True) or {}
@@ -973,9 +959,19 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
 
-def start_flask():
-    log.info("Starting Flask on 0.0.0.0:%s", PORT)
-    flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
+def _resolve_user_from_init(init_data: str) -> tuple[bool, dict | None, str]:
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return False, None, "Invalid auth"
+    tg_user = auth["user"]
+    chat_id = int(tg_user.get("id"))
+    username = tg_user.get("username")
+    upsert_user_if_missing(chat_id, username)
+    return True, {"chat_id": chat_id, "username": username}, ""
+
+@flask_app.get("/app")
+def app_page():
+    return Response(WEBAPP_HTML, mimetype="text/html")
 
 async def start_bot():
     global BOT_USERNAME
@@ -997,6 +993,17 @@ async def start_bot():
     await application.start()
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+async def start_flask():
+    log.info("Starting Flask via uvicorn on 0.0.0.0:%s", PORT)
+    config = uvicorn.Config(
+        WSGIMiddleware(flask_app),
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
 def print_checklist():
     print("=== Tapify Startup Checklist ===")
     print(f"BOT_TOKEN: {'OK' if BOT_TOKEN else 'MISSING'}")
@@ -1005,7 +1012,7 @@ def print_checklist():
     print(f"WEBAPP:    {WEBAPP_URL or '(derive from host)'}")
     print("================================")
 
-def main():
+async def main():
     global conn, USE_POSTGRES
     try:
         if DATABASE_URL:
@@ -1024,14 +1031,8 @@ def main():
     db_init()
     print_checklist()
 
-    th = threading.Thread(target=start_flask, daemon=True)
-    th.start()
-
-    import asyncio
-    try:
-        asyncio.run(start_bot())
-    except KeyboardInterrupt:
-        pass
+    # Run Flask and Telegram bot concurrently in the same event loop
+    await asyncio.gather(start_flask(), start_bot())
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
