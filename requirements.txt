@@ -2,5 +2,3 @@ flask==3.0.3
 python-telegram-bot==21.4  # Compatible with your previous Render fixes
 psycopg[binary]==3.2.2    # For PostgreSQL
 python-dotenv==1.0.1
-gunicorn==23.0.0          # For Render production
-gevent==23.2.1
