@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-# tapify.py — Notcoin-style Telegram Mini App for Render deployment
+# app.py — Notcoin-style Telegram Mini App for Render deployment
 # Requirements:
 #   pip install flask python-telegram-bot psycopg[binary] python-dotenv uvicorn
 #
 # Start:
-#   python tapify.py
+#   python app.py
 #
 # Environment (.env):
 #   BOT_TOKEN=7645079949:AAEkgyy1GTzXXy45LtouLVRaLIGM4g_3WyM
-#   ADMIN_ID=your_admin_id
-#   WEBAPP_URL=https://your-game-service.onrender.com/app
+#   ADMIN_ID=5646269450
+#   WEBAPP_URL=https://tapify.onrender.com/app
 #   DATABASE_URL=postgres://user:pass@host:5432/dbname   # optional; if absent -> SQLite
 #   AI_BOOST_LINK=#
 #   DAILY_TASK_LINK=#
@@ -726,6 +726,10 @@ setInterval(refreshState, 4000);
 def health():
     return Response(INDEX_HEALTH, mimetype="text/plain")
 
+@flask_app.get("/app")
+def app_page():
+    return Response(WEBAPP_HTML, mimetype="text/html")
+
 @flask_app.post("/api/auth/resolve")
 def api_auth_resolve():
     data = request.get_json(silent=True) or {}
@@ -969,10 +973,6 @@ def _resolve_user_from_init(init_data: str) -> tuple[bool, dict | None, str]:
     upsert_user_if_missing(chat_id, username)
     return True, {"chat_id": chat_id, "username": username}, ""
 
-@flask_app.get("/app")
-def app_page():
-    return Response(WEBAPP_HTML, mimetype="text/html")
-
 async def start_bot():
     global BOT_USERNAME
     application = Application.builder().token(BOT_TOKEN).build()
@@ -991,7 +991,14 @@ async def start_bot():
     log.info("Starting bot polling...")
     await application.initialize()
     await application.start()
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run polling manually to avoid starting a new event loop
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    # Keep the bot running until stopped
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await application.updater.stop()
+        await application.stop()
 
 async def start_flask():
     log.info("Starting Flask via uvicorn on 0.0.0.0:%s", PORT)
@@ -999,7 +1006,8 @@ async def start_flask():
         WSGIMiddleware(flask_app),
         host="0.0.0.0",
         port=PORT,
-        log_level="info"
+        log_level="info",
+        lifespan="off"  # Disable ASGI lifespan events
     )
     server = uvicorn.Server(config)
     await server.serve()
