@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # tapify.py — Notcoin-style Telegram Mini App in a single file with improvements
 # Requirements:
-#   pip install flask python-telegram-bot psycopg[binary] python-dotenv
+#   pip install flask python-telegram-bot psycopg[binary] python-dotenv gunicorn
 #
 # Start:
 #   python tapify.py
 #
 # Environment (.env):
-#   BOT_TOKEN=123:ABC...
-#   ADMIN_ID=123456789
-#   WEBAPP_URL=https://your-service.onrender.com/app
+#   BOT_TOKEN=7645079949:AAEkgyy1GTzXXy45LtouLVRaLIGM4g_3WyM
+#   ADMIN_ID=your_admin_id
+#   WEBAPP_URL=https://your-game-service.onrender.com/app
 #   DATABASE_URL=postgres://user:pass@host:5432/dbname   # optional; if absent -> SQLite
-#   AI_BOOST_LINK=...
-#   DAILY_TASK_LINK=...
-#   GROUP_LINK=...
-#   SITE_LINK=...
+#   AI_BOOST_LINK=#
+#   DAILY_TASK_LINK=#
+#   GROUP_LINK=#
+#   SITE_LINK=#
 
 import os
 import sys
@@ -28,10 +28,8 @@ import time
 import secrets
 import typing as t
 from urllib.parse import urlparse, parse_qsl, quote_plus
-
 from datetime import datetime, timedelta, timezone, date
 from collections import deque, defaultdict
-
 from flask import Flask, request, jsonify, Response
 
 # Optional dotenv
@@ -56,6 +54,7 @@ SITE_LINK = os.getenv("SITE_LINK", "#")
 
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN is required in environment (.env).", file=sys.stderr)
+    sys.exit(1)
 
 # Logging
 logging.basicConfig(
@@ -80,12 +79,11 @@ def _connect_sqlite():
 def _connect_postgres(url: str):
     global psycopg
     try:
-        import psycopg  # type: ignore
-        from psycopg.rows import dict_row  # noqa
+        import psycopg
+        from psycopg.rows import dict_row
     except Exception as e:
         log.error("psycopg (v3) is required for Postgres: pip install 'psycopg[binary]'\n%s", e)
         raise
-    # Append sslmode=require if not present
     if "sslmode=" not in url:
         if "?" in url:
             url += "&sslmode=require"
@@ -107,7 +105,6 @@ def db_fetchone(query: str, params: t.Tuple = ()):
             row = cur.fetchone()
             if not row:
                 return None
-            # psycopg default returns tuple; convert with column names
             cols = [desc[0] for desc in cur.description]
             return dict(zip(cols, row))
     else:
@@ -128,8 +125,6 @@ def db_fetchall(query: str, params: t.Tuple = ()):
         return [dict(r) for r in rows]
 
 def db_init():
-    # Core "users" table (compatible with existing setups).
-    # We won't drop or overwrite existing columns; we create minimum needed.
     if USE_POSTGRES:
         db_execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -216,7 +211,6 @@ def db_init():
         """)
 
 def db_now() -> datetime:
-    # Store UTC
     return datetime.now(timezone.utc)
 
 def db_date_utc() -> date:
@@ -232,7 +226,6 @@ def upsert_user_if_missing(chat_id: int, username: str | None):
         else:
             db_execute("INSERT INTO users (chat_id, username, payment_status, invites) VALUES (?,?,?,?)",
                        (chat_id, username, None, 0))
-    # Also ensure game_users exists
     existing_g = db_fetchone("SELECT chat_id FROM game_users WHERE chat_id = ?", (chat_id,)) if not USE_POSTGRES \
         else db_fetchone("SELECT chat_id FROM game_users WHERE chat_id = %s", (chat_id,))
     if not existing_g:
@@ -268,7 +261,6 @@ def add_referral_if_absent(referrer: int, referee: int):
     if USE_POSTGRES:
         db_execute("INSERT INTO game_referrals (referrer, referee, created_at) VALUES (%s,%s,%s)",
                    (referrer, referee, now))
-        # optional bookkeeping on user invites
         db_execute("UPDATE users SET invites=COALESCE(invites,0)+1 WHERE chat_id=%s", (referrer,))
     else:
         db_execute("INSERT INTO game_referrals (referrer, referee, created_at) VALUES (?,?,?)",
@@ -285,7 +277,6 @@ def get_game_user(chat_id: int) -> dict:
     return row or {}
 
 def update_game_user_fields(chat_id: int, fields: dict):
-    # Build dynamic update
     keys = list(fields.keys())
     if not keys:
         return
@@ -317,7 +308,6 @@ def leaderboard(range_: str = "all", limit: int = 50):
         q += "%s" if USE_POSTGRES else "?"
         return db_fetchall(q, (limit,))
     else:
-        # compute from taps in period
         now = db_now()
         if range_ == "day":
             since = now - timedelta(days=1)
@@ -344,22 +334,13 @@ def leaderboard(range_: str = "all", limit: int = 50):
                 LIMIT ?
             """, (since.isoformat(), limit))
 
-# --- Auth: Telegram WebApp initData verification ------------------------------
-
 def _hmac_sha256(key: bytes, data: bytes) -> bytes:
     return hmac.new(key, data, hashlib.sha256).digest()
 
 def verify_init_data(init_data: str, bot_token: str) -> dict | None:
-    """
-    Per Telegram docs:
-      secret_key = HMAC_SHA256(key=bot_token, data=b"WebAppData")
-      data_check_string = "\n".join(sorted(["key=value", ...] excluding 'hash'))
-      calc_hash = hex(HMAC_SHA256(key=secret_key, data=data_check_string.encode()))
-    """
     try:
         items = dict(parse_qsl(init_data, strict_parsing=True))
         provided_hash = items.pop("hash", "")
-        # Build data_check_string
         pairs = []
         for k in sorted(items.keys()):
             pairs.append(f"{k}={items[k]}")
@@ -368,7 +349,6 @@ def verify_init_data(init_data: str, bot_token: str) -> dict | None:
         calc_hash = hmac.new(secret_key, data_check_string, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc_hash, provided_hash):
             return None
-        # Parse "user" JSON if present
         user_payload = {}
         if "user" in items:
             user_payload = json.loads(items["user"])
@@ -381,25 +361,20 @@ def verify_init_data(init_data: str, bot_token: str) -> dict | None:
         log.warning("verify_init_data error: %s", e)
         return None
 
-# --- Game Mechanics: energy, rate-limits, boosts, streaks ---------------------
-
-MAX_TAPS_PER_SEC = 20  # anti-spam
+MAX_TAPS_PER_SEC = 20
 RATE_WINDOW_SEC = 1.0
 
 _rate_windows: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=MAX_TAPS_PER_SEC * 3))
 _recent_nonces: dict[int, set[str]] = defaultdict(set)
 
 def _clean_old_nonces(chat_id: int):
-    # lightweight: keep only up to 200 recent nonces in memory
     s = _recent_nonces[chat_id]
     if len(s) > 200:
-        # reset to keep memory bound
         _recent_nonces[chat_id] = set(list(s)[-100:])
 
 def can_tap_now(chat_id: int) -> bool:
     now = time.monotonic()
     dq = _rate_windows[chat_id]
-    # Remove entries older than 1s
     while dq and now - dq[0] > RATE_WINDOW_SEC:
         dq.popleft()
     if len(dq) >= MAX_TAPS_PER_SEC:
@@ -408,12 +383,8 @@ def can_tap_now(chat_id: int) -> bool:
     return True
 
 def compute_energy(user_row: dict) -> tuple[int, datetime]:
-    """
-    Returns (available_energy, new_energy_updated_at)
-    """
     max_energy = int(user_row.get("max_energy") or 500)
     regen_rate_seconds = int(user_row.get("regen_rate_seconds") or 3)
-
     raw = user_row.get("energy_updated_at")
     if isinstance(raw, str):
         try:
@@ -426,13 +397,11 @@ def compute_energy(user_row: dict) -> tuple[int, datetime]:
         last = raw or db_now()
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
-
     stored_energy = int(user_row.get("energy") or 0)
     now = db_now()
     elapsed = int((now - last).total_seconds())
     regen = elapsed // max(1, regen_rate_seconds)
     energy = min(max_energy, stored_energy + regen)
-    # If regenerated, move the timestamp forward by regen*regen_rate_seconds
     if regen > 0:
         last = last + timedelta(seconds=regen * regen_rate_seconds)
     return energy, last
@@ -450,22 +419,19 @@ def streak_update(gu: dict, tapped_today: bool) -> tuple[int, date]:
         last_date = last_str.date()
     elif isinstance(last_str, date):
         last_date = last_str
-
     streak = int(gu.get("daily_streak") or 0)
     if not tapped_today:
         return streak, last_date or today
-
     if last_date == today - timedelta(days=1):
         streak += 1
     elif last_date == today:
-        pass  # already accounted today
+        pass
     else:
         streak = 1
     return streak, today
 
 def boost_multiplier(gu: dict) -> int:
     mult = 1
-    # MultiTap
     mt = gu.get("multitap_until")
     at = gu.get("autotap_until")
     now = db_now()
@@ -488,18 +454,16 @@ def activate_boost(chat_id: int, boost: str) -> tuple[bool, str]:
     cost = 0
     field = None
     duration = timedelta(minutes=15)
-
     if boost == "multitap":
-        cost = 500  # Reduced cost
+        cost = 500
         field = "multitap_until"
-        duration = timedelta(minutes=30)  # Extended duration
+        duration = timedelta(minutes=30)
     elif boost == "autotap":
         cost = 3000
         field = "autotap_until"
         duration = timedelta(minutes=10)
     elif boost == "maxenergy":
         cost = 2500
-        # one-time upgrade
         if coins < cost:
             return False, "Not enough coins"
         update_game_user_fields(chat_id, {
@@ -509,7 +473,6 @@ def activate_boost(chat_id: int, boost: str) -> tuple[bool, str]:
         return True, "Max energy increased by +100!"
     else:
         return False, "Unknown boost"
-
     if coins < cost:
         return False, "Not enough coins"
     until = now + duration
@@ -518,8 +481,6 @@ def activate_boost(chat_id: int, boost: str) -> tuple[bool, str]:
         field: until
     })
     return True, f"{boost} activated!"
-
-# --- Flask App ----------------------------------------------------------------
 
 flask_app = Flask(__name__)
 
@@ -541,7 +502,7 @@ WEBAPP_HTML = r"""
     }
     .coin {
       width: 220px; height: 220px; border-radius: 50%;
-      background: radial-gradient(circle at 30% 30%, #ff4500, #8b0000); /* Changed to orange-red for more vibrancy */
+      background: radial-gradient(circle at 30% 30%, #ff4500, #8b0000);
       box-shadow: 0 0 30px rgba(255,69,0,0.6), inset 0 0 20px rgba(255,255,255,0.3);
       transition: transform 0.1s ease-in-out, box-shadow 0.3s ease;
       animation: pulse 2s infinite;
@@ -602,43 +563,38 @@ WEBAPP_HTML = r"""
 <body class="text-white">
   <div id="root" class="max-w-sm mx-auto px-4 pt-6 pb-24">
     <div class="flex items-center justify-between">
-      <div class="text-2xl font-bold text-orange-500">Tapify Adventure</div> <!-- Made title more engaging -->
+      <div class="text-2xl font-bold text-orange-500">Tapify Adventure</div>
       <div id="streak" class="text-sm opacity-80">🔥 Streak: 0</div>
     </div>
-
     <div id="locked" class="hidden mt-10 text-center">
       <div class="text-3xl font-bold mb-3">Access Locked</div>
       <div class="opacity-80 mb-6">Complete registration in the bot to start playing.</div>
       <button id="btnCheck" class="px-4 py-2 rounded-lg bg-orange-500 text-black font-semibold">Check again</button>
       <div class="mt-6 text-xs opacity-60">If this persists, close and reopen the webapp.</div>
     </div>
-
     <div id="game" class="mt-8">
       <div class="flex items-center justify-center relative">
         <div id="energyRing" class="relative glow">
-          <div id="tapBtn" class="coin select-none flex items-center justify-center text-4xl font-extrabold text-white">TAP!</div> <!-- Made text bolder -->
+          <div id="tapBtn" class="coin select-none flex items-center justify-center text-4xl font-extrabold text-white">TAP!</div>
         </div>
       </div>
       <div class="mt-6 text-center">
-        <div id="balance" class="text-5xl font-extrabold text-orange-400">0</div> <!-- Larger font for balance -->
+        <div id="balance" class="text-5xl font-extrabold text-orange-400">0</div>
         <div id="energy" class="mt-1 text-sm opacity-80">⚡ 0 / 0</div>
       </div>
-
       <div class="mt-8 grid grid-cols-4 gap-2 text-center text-sm">
         <button class="tab active py-2" data-tab="play">Play</button>
         <button class="tab py-2" data-tab="boosts">Boosts</button>
         <button class="tab py-2" data-tab="board">Leaderboard</button>
         <button class="tab py-2" data-tab="refer">Refer</button>
       </div>
-
       <div id="panelPlay" class="mt-6">
-        <button id="dailyRewardBtn" class="px-4 py-2 rounded-lg bg-orange-500 text-black font-semibold w-full mb-4">Claim Daily Reward</button> <!-- Added daily reward button -->
+        <button id="dailyRewardBtn" class="px-4 py-2 rounded-lg bg-orange-500 text-black font-semibold w-full mb-4">Claim Daily Reward</button>
       </div>
-
       <div id="panelBoosts" class="hidden mt-6 space-y-3">
-        <div class="bg-white/5 p-4 rounded-xl shadow-lg"> <!-- Added shadow for depth -->
-          <div class="font-semibold text-orange-400">MultiTap x2 (30m)</div> <!-- Updated duration in UI -->
-          <div class="text-xs opacity-70 mb-2">Cost: 500</div> <!-- Updated cost in UI -->
+        <div class="bg-white/5 p-4 rounded-xl shadow-lg">
+          <div class="font-semibold text-orange-400">MultiTap x2 (30m)</div>
+          <div class="text-xs opacity-70 mb-2">Cost: 500</div>
           <button data-boost="multitap" class="boostBtn px-3 py-2 rounded-lg bg-orange-500 text-black w-full">Activate</button>
         </div>
         <div class="bg-white/5 p-4 rounded-xl shadow-lg">
@@ -652,7 +608,6 @@ WEBAPP_HTML = r"""
           <button data-boost="maxenergy" class="boostBtn px-3 py-2 rounded-lg bg-orange-500 text-black w-full">Upgrade</button>
         </div>
       </div>
-
       <div id="panelBoard" class="hidden mt-6">
         <div class="flex gap-2 text-sm">
           <button class="lbBtn px-3 py-1 rounded bg-white/10" data-range="day">Today</button>
@@ -661,10 +616,9 @@ WEBAPP_HTML = r"""
         </div>
         <ol id="lbList" class="mt-4 space-y-2"></ol>
       </div>
-
       <div id="panelRefer" class="hidden mt-6">
         <div class="bg-white/5 p-4 rounded-xl shadow-lg">
-          <div class="font-semibold text-orange-400 mb-1">Invite Friends & Earn!</div> <!-- Made title more engaging -->
+          <div class="font-semibold text-orange-400 mb-1">Invite Friends & Earn!</div>
           <div class="text-xs opacity-70 mb-2">Share your link to earn bonuses.</div>
           <input id="refLink" class="w-full px-3 py-2 rounded bg-black/30 border border-white/10" readonly />
           <button id="copyRef" class="mt-2 px-3 py-2 rounded bg-orange-500 text-black w-full">Copy Link</button>
@@ -678,43 +632,36 @@ WEBAPP_HTML = r"""
       </div>
     </div>
   </div>
-
 <script>
 const tg = window.Telegram?.WebApp;
 if (tg) tg.expand();
-
 const $ = (q) => document.querySelector(q);
 const $$ = (q) => Array.from(document.querySelectorAll(q));
-
 function setTab(name) {
-  $$(".tab").forEach(b=>{
-    b.classList.toggle("active", b.dataset.tab===name);
+  $$(".tab").forEach(b => {
+    b.classList.toggle("active", b.dataset.tab === name);
   });
-  $("#panelPlay").classList.toggle("hidden", name!=="play");
-  $("#panelBoosts").classList.toggle("hidden", name!=="boosts");
-  $("#panelBoard").classList.toggle("hidden", name!=="board");
-  $("#panelRefer").classList.toggle("hidden", name!=="refer");
+  $("#panelPlay").classList.toggle("hidden", name !== "play");
+  $("#panelBoosts").classList.toggle("hidden", name !== "boosts");
+  $("#panelBoard").classList.toggle("hidden", name !== "board");
+  $("#panelRefer").classList.toggle("hidden", name !== "refer");
 }
-$$(".tab").forEach(b => b.addEventListener("click", ()=> setTab(b.dataset.tab)));
-
-const haptics = (type="light") => {
-  try { tg?.HapticFeedback?.impactOccurred(type); } catch(e){}
+$$(".tab").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
+const haptics = (type = "light") => {
+  try { tg?.HapticFeedback?.impactOccurred(type); } catch (e) {}
 };
-
 let USER = null;
 let LOCKED = false;
 let RANGE = "all";
-
 async function api(path, body) {
   const initData = tg?.initData || "";
   const res = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type":"application/json" },
-    body: JSON.stringify(Object.assign({initData}, body||{}))
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ initData }, body || {}))
   });
   return await res.json();
 }
-
 async function resolveAuth() {
   const out = await api("/api/auth/resolve");
   if (!out.ok) {
@@ -734,17 +681,14 @@ async function resolveAuth() {
   $("#siteLink").href = out.siteLink;
   if (out.allowed) await refreshState();
 }
-
 $("#btnCheck").addEventListener("click", resolveAuth);
-
 async function refreshState() {
   const out = await api("/api/state");
   if (!out.ok) return;
   $("#balance").textContent = out.coins;
   $("#energy").textContent = `⚡ ${out.energy} / ${out.max_energy}`;
-  $("#streak").textContent = `🔥 Streak: ${out.daily_streak||0}`;
+  $("#streak").textContent = `🔥 Streak: ${out.daily_streak || 0}`;
 }
-
 function createParticles(x, y, count = 10) {
   for (let i = 0; i < count; i++) {
     const particle = document.createElement('div');
@@ -759,7 +703,6 @@ function createParticles(x, y, count = 10) {
     setTimeout(() => particle.remove(), 1000);
   }
 }
-
 async function doTap(e) {
   if (LOCKED) return;
   const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(12))));
@@ -776,38 +719,32 @@ async function doTap(e) {
   const rect = $("#tapBtn").getBoundingClientRect();
   createParticles(rect.left + rect.width / 2, rect.top + rect.height / 2);
 }
-
 $("#tapBtn").addEventListener("click", doTap);
-
-$$(".boostBtn").forEach(b=>{
-  b.addEventListener("click", async ()=>{
+$$(".boostBtn").forEach(b => {
+  b.addEventListener("click", async () => {
     const out = await api("/api/boost", { name: b.dataset.boost });
     if (out.ok) { await refreshState(); haptics("medium"); }
     else if (out.error) alert(out.error);
   });
 });
-
-$$(".lbBtn").forEach(b=>{
-  b.addEventListener("click", async ()=>{
+$$(".lbBtn").forEach(b => {
+  b.addEventListener("click", async () => {
     RANGE = b.dataset.range;
     const q = await fetch(`/api/leaderboard?range=${RANGE}`);
     const data = await q.json();
     const list = $("#lbList"); list.innerHTML = "";
-    (data.items || []).forEach((r, i)=>{
+    (data.items || []).forEach((r, i) => {
       const li = document.createElement("li");
-      li.className = "flex justify-between bg-white/5 px-3 py-2 rounded-lg shadow-md"; // Added shadow
-      li.innerHTML = `<div>#${i+1} @${r.username||r.chat_id}</div><div>${r.score}</div>`;
+      li.className = "flex justify-between bg-white/5 px-3 py-2 rounded-lg shadow-md";
+      li.innerHTML = `<div>#${i+1} @${r.username || r.chat_id}</div><div>${r.score}</div>`;
       list.appendChild(li);
     });
   });
 });
-
-$("#copyRef").addEventListener("click", ()=>{
+$("#copyRef").addEventListener("click", () => {
   navigator.clipboard.writeText($("#refLink").value);
   haptics("light");
 });
-
-// Daily Reward
 $("#dailyRewardBtn").addEventListener("click", async () => {
   const out = await api("/api/daily_reward");
   if (out.ok) {
@@ -818,7 +755,6 @@ $("#dailyRewardBtn").addEventListener("click", async () => {
     alert(out.error);
   }
 });
-
 setTab("play");
 resolveAuth();
 setInterval(refreshState, 4000);
@@ -854,8 +790,6 @@ def api_auth_resolve():
         return jsonify({"ok": False, "error": err})
     chat_id = user["chat_id"]
     allowed = is_registered(chat_id)
-    # Build referral link
-    # NOTE: client will embed in UI
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{chat_id}" if BOT_USERNAME else ""
     return jsonify({
         "ok": True,
@@ -887,7 +821,6 @@ def api_state():
         "max_energy": int(gu.get("max_energy") or 500),
         "daily_streak": int(gu.get("daily_streak") or 0),
     }
-    # persist recomputed energy timestamp/amount
     update_game_user_fields(chat_id, {"energy": energy, "energy_updated_at": energy_ts})
     return jsonify(out)
 
@@ -918,25 +851,21 @@ def api_tap():
         return jsonify({"ok": False, "error": "Not registered"})
     if not can_tap_now(chat_id):
         return jsonify({"ok": False, "error": "Rate limited"})
-
     if not nonce or len(nonce) > 200:
         return jsonify({"ok": False, "error": "Bad nonce"})
     if nonce in _recent_nonces[chat_id]:
         return jsonify({"ok": False, "error": "Replay blocked"})
     _recent_nonces[chat_id].add(nonce)
     _clean_old_nonces(chat_id)
-
     gu = get_game_user(chat_id)
     energy, energy_ts = compute_energy(gu)
     if energy < 1:
         return jsonify({"ok": False, "error": "No energy", "coins": int(gu.get("coins") or 0),
                         "energy": energy, "max_energy": int(gu.get("max_energy") or 500)})
     mult = boost_multiplier(gu)
-    delta = 2 * mult  # Increased base reward per tap
+    delta = 2 * mult
     add_tap(chat_id, delta, nonce)
-    # consume 1 energy
     update_game_user_fields(chat_id, {"energy": energy - 1, "energy_updated_at": energy_ts})
-    # streak handling
     new_streak, streak_date = streak_update(gu, tapped_today=True)
     update_game_user_fields(chat_id, {"daily_streak": new_streak, "last_streak_at": streak_date})
     gu2 = get_game_user(chat_id)
@@ -964,7 +893,7 @@ def api_daily_reward():
     if last_reward and (isinstance(last_reward, str) and last_reward == today.isoformat() or
                         isinstance(last_reward, date) and last_reward == today):
         return jsonify({"ok": False, "error": "Already claimed today"})
-    coins = int(gu.get("coins") or 0) + 100  # Award 100 coins
+    coins = int(gu.get("coins") or 0) + 100
     update_game_user_fields(chat_id, {"coins": coins, "last_daily_reward": today})
     return jsonify({"ok": True, "coins": coins})
 
@@ -976,17 +905,11 @@ def api_leaderboard():
     items = leaderboard(rng, 50)
     return jsonify({"ok": True, "items": items})
 
-# --- Telegram Bot -------------------------------------------------------------
-
-from telegram import (
-    Update, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo,
-)
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-BOT_USERNAME = ""  # populated on startup
+BOT_USERNAME = ""
 
 def deep_link_ref(chat_id: int) -> str:
     if not BOT_USERNAME:
@@ -998,8 +921,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = user.id
     username = user.username or ""
     upsert_user_if_missing(chat_id, username)
-
-    # Handle referral code
     args = context.args or []
     if args and len(args) >= 1 and args[0].startswith("ref_"):
         try:
@@ -1007,7 +928,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_referral_if_absent(referrer, chat_id)
         except Exception:
             pass
-
     kb = [[KeyboardButton(text="Open Game", web_app=WebAppInfo(url=WEBAPP_URL))]]
     text = (
         "Welcome to <b>Tapify</b>!\n\n"
@@ -1034,9 +954,6 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-def _is_admin(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == ADMIN_ID
-
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return
@@ -1044,7 +961,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /broadcast <message>")
         return
     msg = " ".join(context.args)
-    # get all players who have a game_users row
     rows = db_fetchall("SELECT chat_id FROM game_users", ())
     sent = 0
     for r in rows:
@@ -1093,10 +1009,10 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 Top 10 (all time)\n" + "\n".join(lines))
 
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Provide a quick open link
     await update.message.reply_text(f"Open the game here:\n{WEBAPP_URL}")
 
-# --- Startup orchestration ----------------------------------------------------
+def _is_admin(update: Update) -> bool:
+    return update.effective_user and update.effective_user.id == ADMIN_ID
 
 def start_flask():
     log.info("Starting Flask on 0.0.0.0:%s", PORT)
@@ -1120,9 +1036,7 @@ async def start_bot():
     log.info("Starting bot polling...")
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
-    # Keep running until process exit
-    await application.updater.wait()
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def print_checklist():
     print("=== Tapify Startup Checklist ===")
@@ -1134,7 +1048,6 @@ def print_checklist():
 
 def main():
     global conn, USE_POSTGRES
-    # DB connect
     try:
         if DATABASE_URL:
             conn_pg = _connect_postgres(DATABASE_URL)
@@ -1149,16 +1062,13 @@ def main():
         log.error("Database connection failed: %s", e)
         sys.exit(1)
 
-    # Create tables
     db_init()
-
     print_checklist()
 
-    # Start Flask in a thread (Render health checks hit this)
-    th = threading.Thread(target=start_flask, daemon=True)
-    th.start()
+    if os.getenv("RENDER") != "true":
+        th = threading.Thread(target=start_flask, daemon=True)
+        th.start()
 
-    # Start Telegram bot (async)
     import asyncio
     try:
         asyncio.run(start_bot())
