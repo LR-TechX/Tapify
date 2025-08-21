@@ -10,7 +10,7 @@
 #   BOT_TOKEN=7645079949:AAEkgyy1GTzXXy45LtouLVRaLIGM4g_3WyM
 #   ADMIN_ID=5646269450
 #   WEBAPP_URL=https://tapify.onrender.com/app
-#   DATABASE_URL=postgres://user:pass@host:5432/dbname   # optional; if absent -> SQLite
+#   DATABASE_URL=postgres://user:pass@host:5432/dbname   # required; no fallback
 #   AI_BOOST_LINK=#
 #   DAILY_TASK_LINK=#
 #   GROUP_LINK=#
@@ -63,18 +63,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("tapify")
 
-# --- Database Layer (psycopg v3 if DATABASE_URL else SQLite) ------------------
+# --- Database Layer (PostgreSQL only) ------------------
 
-USE_POSTGRES = False
 psycopg = None
 conn = None  # type: ignore
-
-import sqlite3
-
-def _connect_sqlite():
-    db = sqlite3.connect("tapify.db", check_same_thread=False, isolation_level=None)
-    db.row_factory = sqlite3.Row
-    return db
 
 def _connect_postgres(url: str):
     global psycopg
@@ -89,120 +81,75 @@ def _connect_postgres(url: str):
             url += "&sslmode=require"
         else:
             url += "?sslmode=require"
-    return psycopg.connect(url, row_factory=dict_row)
+    try:
+        conn_pg = psycopg.connect(url, row_factory=dict_row)
+        conn_pg.autocommit = True
+        log.info("Postgres connected successfully")
+        return conn_pg
+    except Exception as e:
+        log.error(f"Postgres connection failed: {e}")
+        raise
 
 def db_execute(query: str, params: t.Tuple = ()):
-    if USE_POSTGRES:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-    else:
-        conn.execute(query, params)
+    with conn.cursor() as cur:
+        cur.execute(query, params)
 
 def db_fetchone(query: str, params: t.Tuple = ()):
-    if USE_POSTGRES:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            return cur.fetchone()
-    else:
-        cur = conn.execute(query, params)
-        row = cur.fetchone()
-        return dict(row) if row else None
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return cur.fetchone()
 
 def db_fetchall(query: str, params: t.Tuple = ()):
-    if USE_POSTGRES:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            return cur.fetchall()
-    else:
-        cur = conn.execute(query, params)
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
 
 def db_init():
-    if USE_POSTGRES:
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id BIGINT PRIMARY KEY,
-            username TEXT,
-            payment_status TEXT DEFAULT NULL,
-            invites INTEGER DEFAULT 0
-        );
-        """)
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS game_users (
-            chat_id BIGINT PRIMARY KEY,
-            coins BIGINT DEFAULT 0,
-            energy INT DEFAULT 500,
-            max_energy INT DEFAULT 500,
-            energy_updated_at TIMESTAMP,
-            multitap_until TIMESTAMP,
-            autotap_until TIMESTAMP,
-            regen_rate_seconds INT DEFAULT 3,
-            last_tap_at TIMESTAMP,
-            daily_streak INT DEFAULT 0,
-            last_streak_at DATE,
-            last_daily_reward DATE
-        );
-        """)
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS game_taps (
-            id BIGSERIAL PRIMARY KEY,
-            chat_id BIGINT NOT NULL,
-            ts TIMESTAMP NOT NULL,
-            delta INT NOT NULL,
-            nonce TEXT NOT NULL
-        );
-        """)
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS game_referrals (
-            referrer BIGINT NOT NULL,
-            referee BIGINT NOT NULL,
-            created_at TIMESTAMP NOT NULL,
-            PRIMARY KEY (referrer, referee)
-        );
-        """)
-    else:
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            username TEXT,
-            payment_status TEXT DEFAULT NULL,
-            invites INTEGER DEFAULT 0
-        );
-        """)
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS game_users (
-            chat_id INTEGER PRIMARY KEY,
-            coins INTEGER DEFAULT 0,
-            energy INTEGER DEFAULT 500,
-            max_energy INTEGER DEFAULT 500,
-            energy_updated_at TEXT,
-            multitap_until TEXT,
-            autotap_until TEXT,
-            regen_rate_seconds INTEGER DEFAULT 3,
-            last_tap_at TEXT,
-            daily_streak INTEGER DEFAULT 0,
-            last_streak_at TEXT,
-            last_daily_reward TEXT
-        );
-        """)
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS game_taps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            ts TEXT NOT NULL,
-            delta INTEGER NOT NULL,
-            nonce TEXT NOT NULL
-        );
-        """)
-        db_execute("""
-        CREATE TABLE IF NOT EXISTS game_referrals (
-            referrer INTEGER NOT NULL,
-            referee INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (referrer, referee)
-        );
-        """)
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL must be set for PostgreSQL")
+    global conn
+    conn = _connect_postgres(DATABASE_URL)
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        chat_id BIGINT PRIMARY KEY,
+        username TEXT,
+        payment_status TEXT DEFAULT NULL,
+        invites INTEGER DEFAULT 0
+    );
+    """)
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS game_users (
+        chat_id BIGINT PRIMARY KEY,
+        coins BIGINT DEFAULT 0,
+        energy INT DEFAULT 500,
+        max_energy INT DEFAULT 500,
+        energy_updated_at TIMESTAMP,
+        multitap_until TIMESTAMP,
+        autotap_until TIMESTAMP,
+        regen_rate_seconds INT DEFAULT 3,
+        last_tap_at TIMESTAMP,
+        daily_streak INT DEFAULT 0,
+        last_streak_at DATE,
+        last_daily_reward DATE
+    );
+    """)
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS game_taps (
+        id BIGSERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        ts TIMESTAMP NOT NULL,
+        delta INT NOT NULL,
+        nonce TEXT NOT NULL
+    );
+    """)
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS game_referrals (
+        referrer BIGINT NOT NULL,
+        referee BIGINT NOT NULL,
+        created_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (referrer, referee)
+    );
+    """)
 
 def db_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -211,62 +158,65 @@ def db_date_utc() -> date:
     return db_now().date()
 
 def upsert_user_if_missing(chat_id: int, username: str | None):
-    existing = db_fetchone("SELECT chat_id FROM users WHERE chat_id = %s" if USE_POSTGRES else "SELECT chat_id FROM users WHERE chat_id = ?", (chat_id,))
+    existing = db_fetchone("SELECT chat_id FROM users WHERE chat_id = %s", (chat_id,))
     if not existing:
-        db_execute("INSERT INTO users (chat_id, username, payment_status, invites) VALUES (%s,%s,%s,%s)" if USE_POSTGRES else "INSERT INTO users (chat_id, username, payment_status, invites) VALUES (?,?,?,?)",
+        db_execute("INSERT INTO users (chat_id, username, payment_status, invites) VALUES (%s,%s,%s,%s)",
                    (chat_id, username, None, 0))
-    existing_g = db_fetchone("SELECT chat_id FROM game_users WHERE chat_id = %s" if USE_POSTGRES else "SELECT chat_id FROM game_users WHERE chat_id = ?", (chat_id,))
+    existing_g = db_fetchone("SELECT chat_id FROM game_users WHERE chat_id = %s", (chat_id,))
     if not existing_g:
         now = db_now()
         db_execute("""INSERT INTO game_users
             (chat_id, coins, energy, max_energy, energy_updated_at, regen_rate_seconds, daily_streak, last_daily_reward)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""" if USE_POSTGRES else """INSERT INTO game_users
-            (chat_id, coins, energy, max_energy, energy_updated_at, regen_rate_seconds, daily_streak, last_daily_reward)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (chat_id, 0, 500, 500, now if USE_POSTGRES else now.isoformat(), 3, 0, None))
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (chat_id, 0, 500, 500, now, 3, 0, None))
 
 def is_registered(chat_id: int) -> bool:
-    row = db_fetchone("SELECT payment_status FROM users WHERE chat_id = %s" if USE_POSTGRES else "SELECT payment_status FROM users WHERE chat_id = ?", (chat_id,))
-    if not row:
+    try:
+        row = db_fetchone("SELECT payment_status FROM users WHERE chat_id = %s", (chat_id,))
+        log.info(f"Checked registration for {chat_id}: {row}")
+        if not row:
+            return False
+        return (row.get("payment_status") or "").lower() == "registered"
+    except Exception as e:
+        log.error(f"DB query failed for is_registered {chat_id}: {e}")
         return False
-    return (row.get("payment_status") or "").lower() == "registered"
 
 def add_referral_if_absent(referrer: int, referee: int):
     if referrer == referee or referee <= 0:
         return
-    r = db_fetchone("SELECT 1 FROM game_referrals WHERE referrer=%s AND referee=%s" if USE_POSTGRES else "SELECT 1 FROM game_referrals WHERE referrer=? AND referee=?", (referrer, referee))
+    r = db_fetchone("SELECT 1 FROM game_referrals WHERE referrer=%s AND referee=%s", (referrer, referee))
     if r:
         return
     now = db_now()
-    db_execute("INSERT INTO game_referrals (referrer, referee, created_at) VALUES (%s,%s,%s)" if USE_POSTGRES else "INSERT INTO game_referrals (referrer, referee, created_at) VALUES (?,?,?)",
-               (referrer, referee, now if USE_POSTGRES else now.isoformat()))
-    db_execute("UPDATE users SET invites=COALESCE(invites,0)+1 WHERE chat_id=%s" if USE_POSTGRES else "UPDATE users SET invites=COALESCE(invites,0)+1 WHERE chat_id=?", (referrer,))
+    db_execute("INSERT INTO game_referrals (referrer, referee, created_at) VALUES (%s,%s,%s)",
+               (referrer, referee, now))
+    db_execute("UPDATE users SET invites=COALESCE(invites,0)+1 WHERE chat_id=%s", (referrer,))
 
 def get_game_user(chat_id: int) -> dict:
-    row = db_fetchone("SELECT * FROM game_users WHERE chat_id = %s" if USE_POSTGRES else "SELECT * FROM game_users WHERE chat_id = ?", (chat_id,))
+    row = db_fetchone("SELECT * FROM game_users WHERE chat_id = %s", (chat_id,))
     if not row:
         upsert_user_if_missing(chat_id, None)
-        row = db_fetchone("SELECT * FROM game_users WHERE chat_id = %s" if USE_POSTGRES else "SELECT * FROM game_users WHERE chat_id = ?", (chat_id,))
+        row = db_fetchone("SELECT * FROM game_users WHERE chat_id = %s", (chat_id,))
     return row or {}
 
 def update_game_user_fields(chat_id: int, fields: dict):
     keys = list(fields.keys())
     if not keys:
         return
-    set_clause = ", ".join(f"{k}=%s" if USE_POSTGRES else f"{k}=?" for k in keys)
+    set_clause = ", ".join(f"{k}=%s" for k in keys)
     params = tuple(fields[k] for k in keys) + (chat_id,)
-    db_execute(f"UPDATE game_users SET {set_clause} WHERE chat_id={'%s' if USE_POSTGRES else '?'}", params)
+    db_execute(f"UPDATE game_users SET {set_clause} WHERE chat_id=%s", params)
 
 def add_tap(chat_id: int, delta: int, nonce: str):
     now = db_now()
-    db_execute("INSERT INTO game_taps (chat_id, ts, delta, nonce) VALUES (%s,%s,%s,%s)" if USE_POSTGRES else "INSERT INTO game_taps (chat_id, ts, delta, nonce) VALUES (?,?,?,?)",
-               (chat_id, now if USE_POSTGRES else now.isoformat(), delta, nonce))
-    db_execute("UPDATE game_users SET coins=COALESCE(coins,0)+%s, last_tap_at=%s WHERE chat_id=%s" if USE_POSTGRES else "UPDATE game_users SET coins=COALESCE(coins,0)+?, last_tap_at=? WHERE chat_id=?",
-               (delta, now if USE_POSTGRES else now.isoformat(), chat_id))
+    db_execute("INSERT INTO game_taps (chat_id, ts, delta, nonce) VALUES (%s,%s,%s,%s)",
+               (chat_id, now, delta, nonce))
+    db_execute("UPDATE game_users SET coins=COALESCE(coins,0)+%s, last_tap_at=%s WHERE chat_id=%s",
+               (delta, now, chat_id))
 
 def leaderboard(range_: str = "all", limit: int = 50):
     if range_ == "all":
-        q = "SELECT u.username, g.chat_id, g.coins AS score FROM game_users g LEFT JOIN users u ON u.chat_id=g.chat_id ORDER BY score DESC LIMIT %s" if USE_POSTGRES else "SELECT u.username, g.chat_id, g.coins AS score FROM game_users g LEFT JOIN users u ON u.chat_id=g.chat_id ORDER BY score DESC LIMIT ?"
+        q = "SELECT u.username, g.chat_id, g.coins AS score FROM game_users g LEFT JOIN users u ON u.chat_id=g.chat_id ORDER BY score DESC LIMIT %s"
         return db_fetchall(q, (limit,))
     else:
         now = db_now()
@@ -282,16 +232,8 @@ def leaderboard(range_: str = "all", limit: int = 50):
             GROUP BY t.chat_id, u.username
             ORDER BY score DESC
             LIMIT %s
-        """ if USE_POSTGRES else """
-            SELECT u.username, t.chat_id, COALESCE(SUM(t.delta),0) AS score
-            FROM game_taps t
-            LEFT JOIN users u ON u.chat_id=t.chat_id
-            WHERE t.ts >= ?
-            GROUP BY t.chat_id, u.username
-            ORDER BY score DESC
-            LIMIT ?
         """
-        return db_fetchall(q, (since if USE_POSTGRES else since.isoformat(), limit))
+        return db_fetchall(q, (since, limit))
 
 def _hmac_sha256(key: bytes, data: bytes) -> bytes:
     return hmac.new(key, data, hashlib.sha256).digest()
@@ -437,7 +379,7 @@ def activate_boost(chat_id: int, boost: str) -> tuple[bool, str]:
     until = now + duration
     update_game_user_fields(chat_id, {
         "coins": coins - cost,
-        field: until if USE_POSTGRES else until.isoformat()
+        field: until
     })
     return True, f"{boost} activated!"
 
@@ -770,7 +712,7 @@ def api_state():
         "max_energy": int(gu.get("max_energy") or 500),
         "daily_streak": int(gu.get("daily_streak") or 0),
     }
-    update_game_user_fields(chat_id, {"energy": energy, "energy_updated_at": energy_ts if USE_POSTGRES else energy_ts.isoformat()})
+    update_game_user_fields(chat_id, {"energy": energy, "energy_updated_at": energy_ts})
     return jsonify(out)
 
 @flask_app.post("/api/boost")
@@ -814,9 +756,9 @@ def api_tap():
     mult = boost_multiplier(gu)
     delta = 2 * mult
     add_tap(chat_id, delta, nonce)
-    update_game_user_fields(chat_id, {"energy": energy - 1, "energy_updated_at": energy_ts if USE_POSTGRES else energy_ts.isoformat()})
+    update_game_user_fields(chat_id, {"energy": energy - 1, "energy_updated_at": energy_ts})
     new_streak, streak_date = streak_update(gu, tapped_today=True)
-    update_game_user_fields(chat_id, {"daily_streak": new_streak, "last_streak_at": streak_date if USE_POSTGRES else streak_date.isoformat()})
+    update_game_user_fields(chat_id, {"daily_streak": new_streak, "last_streak_at": streak_date})
     gu2 = get_game_user(chat_id)
     energy2, _ = compute_energy(gu2)
     return jsonify({
@@ -843,7 +785,7 @@ def api_daily_reward():
                         isinstance(last_reward, date) and last_reward == today):
         return jsonify({"ok": False, "error": "Already claimed today"})
     coins = int(gu.get("coins") or 0) + 100
-    update_game_user_fields(chat_id, {"coins": coins, "last_daily_reward": today if USE_POSTGRES else today.isoformat()})
+    update_game_user_fields(chat_id, {"coins": coins, "last_daily_reward": today})
     return jsonify({"ok": True, "coins": coins})
 
 @flask_app.get("/api/leaderboard")
@@ -853,6 +795,10 @@ def api_leaderboard():
         rng = "all"
     items = leaderboard(rng, 50)
     return jsonify({"ok": True, "items": items})
+
+@flask_app.get("/api/debug_user/<int:chat_id>")
+def debug_user(chat_id):
+    return jsonify(db_fetchone("SELECT * FROM users WHERE chat_id = %s", (chat_id,)))
 
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
@@ -1016,31 +962,19 @@ def print_checklist():
     print("=== Tapify Startup Checklist ===")
     print(f"BOT_TOKEN: {'OK' if BOT_TOKEN else 'MISSING'}")
     print(f"ADMIN_ID:  {ADMIN_ID if ADMIN_ID else 'MISSING'}")
-    print(f"DB:        {'Postgres' if USE_POSTGRES else 'SQLite'}")
+    print(f"DB:        {'Postgres' if DATABASE_URL else 'MISSING'}")
     print(f"WEBAPP:    {WEBAPP_URL or '(derive from host)'}")
     print("================================")
 
 async def main():
-    global conn, USE_POSTGRES
     try:
-        if DATABASE_URL:
-            conn_pg = _connect_postgres(DATABASE_URL)
-            conn_pg.autocommit = True
-            conn = conn_pg
-            USE_POSTGRES = True
-            log.info("Connected to Postgres")
-        else:
-            conn = _connect_sqlite()
-            log.info("Connected to SQLite")
+        db_init()
+        print_checklist()
+        # Run Flask and Telegram bot concurrently in the same event loop
+        await asyncio.gather(start_flask(), start_bot())
     except Exception as e:
-        log.error("Database connection failed: %s", e)
+        log.error("Startup failed: %s", e)
         sys.exit(1)
-
-    db_init()
-    print_checklist()
-
-    # Run Flask and Telegram bot concurrently in the same event loop
-    await asyncio.gather(start_flask(), start_bot())
 
 if __name__ == "__main__":
     asyncio.run(main())
