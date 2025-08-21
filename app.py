@@ -14,8 +14,8 @@ import psycopg
 import os
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
-import asyncio
 import threading
+import time
 
 # Flask setup
 app = Flask(__name__, template_folder='templates')
@@ -72,12 +72,18 @@ def update_balance(chat_id, amount):
     except psycopg.Error as e:
         logger.error(f"Database error in update_balance {chat_id}: {e}")
 
+# Error page for missing chat_id
+@app.route('/error')
+def error_page():
+    return render_template('error.html', message="Unable to identify user. Please access the game through the Telegram bot.")
+
 # Main game route
 @app.route('/app')
 def game():
     chat_id = request.args.get('chat_id', type=int)
     if not chat_id:
-        return jsonify({"error": "Chat ID required"}), 400
+        logger.warning("Missing chat_id in /app request")
+        return redirect('/error')
     logger.info(f"Game accessed by chat_id: {chat_id}")
     if not is_registered(chat_id):
         logger.warning(f"User {chat_id} not registered")
@@ -256,224 +262,6 @@ def get_prediction():
     except psycopg.Error as e:
         logger.error(f"Database error in get_prediction {chat_id}: {e}")
         return jsonify({"error": "Internal server error"}), 500
-
-# Templates
-@app.route('/templates/register.html')
-def register_template():
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Tapify - Register</title>
-        <style>
-            body { font-family: Arial, sans-serif; text-align: center; background-color: #f0f0f0; }
-            .container { margin-top: 50px; }
-            h1 { color: #333; }
-            p { font-size: 18px; }
-            a { color: #007bff; text-decoration: none; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Please Register</h1>
-            <p>You need to register to play the game. Go back to the Telegram bot and complete the registration process.</p>
-            <p><a href="https://t.me/your_bot_username">Return to Bot</a></p>
-        </div>
-    </body>
-    </html>
-    '''
-
-@app.route('/templates/game.html')
-def game_template():
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Tapify Game</title>
-        <style>
-            body { font-family: Arial, sans-serif; text-align: center; background-color: #f0f0f0; }
-            .container { margin-top: 20px; }
-            .game-area { margin: 20px auto; padding: 20px; background: white; border-radius: 10px; width: 80%; max-width: 600px; }
-            button { padding: 10px 20px; font-size: 16px; margin: 10px; cursor: pointer; }
-            #score, #balance { font-size: 18px; margin: 10px 0; }
-            .tab { display: inline-block; margin: 10px; padding: 10px; cursor: pointer; background: #ddd; border-radius: 5px; }
-            .tab.active { background: #007bff; color: white; }
-            .tab-content { display: none; }
-            .tab-content.active { display: block; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Tapify Game</h1>
-            <div id="balance">Balance: ${{ balance }}</div>
-            <div class="tabs">
-                <div class="tab" onclick="openTab('tapify')">Tapify</div>
-                <div class="tab" onclick="openTab('aviator')">Aviator</div>
-                <div class="tab" onclick="openTab('predictions')">Predictions</div>
-            </div>
-            <div id="tapify" class="tab-content game-area">
-                <p id="score">Score: 0</p>
-                <button onclick="tap()">Tap Me!</button>
-                <button onclick="claimDailyReward()">Claim Daily Reward</button>
-            </div>
-            <div id="aviator" class="tab-content game-area">
-                <p>Aviator Game</p>
-                <input type="number" id="fundAmount" placeholder="Amount to fund (USD)">
-                <button onclick="fundAviator()">Fund Aviator</button>
-                <input type="number" id="betAmount" placeholder="Bet amount (USD)">
-                <button onclick="placeBet()">Place Bet</button>
-                <button onclick="cashout()">Cash Out</button>
-                <input type="number" id="withdrawAmount" placeholder="Withdraw amount (NGN)">
-                <button onclick="withdraw()">Withdraw</button>
-            </div>
-            <div id="predictions" class="tab-content game-area">
-                <p>Football Predictions</p>
-                <select id="matchSelect"></select>
-                <button onclick="getPrediction()">Get Prediction ($0.5)</button>
-                <p id="predictionResult"></p>
-            </div>
-        </div>
-        <script>
-            const chatId = {{ chat_id }};
-            let score = 0;
-
-            function openTab(tabName) {
-                document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
-                document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-                document.getElementById(tabName).classList.add('active');
-                document.querySelector(`.tab[onclick="openTab('${tabName}')"]`).classList.add('active');
-                if (tabName === 'predictions') loadMatches();
-            }
-
-            function tap() {
-                score += 100;
-                document.getElementById('score').innerText = `Score: ${score}`;
-                fetch('/api/update_score', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId, score: 100})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        document.getElementById('balance').innerText = `Balance: $${data.new_balance}`;
-                    }
-                });
-            }
-
-            function claimDailyReward() {
-                fetch('/api/claim_daily_reward', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        alert(`Daily reward of $${data.reward} claimed!`);
-                        document.getElementById('balance').innerText = `Balance: $${data.new_balance}`;
-                    } else {
-                        alert(data.error);
-                    }
-                });
-            }
-
-            function fundAviator() {
-                const amount = parseFloat(document.getElementById('fundAmount').value);
-                fetch('/api/aviator/fund', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId, amount: amount})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        alert(`Funded Aviator with $${amount}`);
-                        document.getElementById('balance').innerText = `Balance: $${data.new_balance}`;
-                    } else {
-                        alert(data.error);
-                    }
-                });
-            }
-
-            function placeBet() {
-                const betAmount = parseFloat(document.getElementById('betAmount').value);
-                fetch('/api/aviator/bet', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId, bet_amount: betAmount})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        alert(`Bet of $${betAmount} placed`);
-                    } else {
-                        alert(data.error);
-                    }
-                });
-            }
-
-            function cashout() {
-                const multiplier = Math.random() * 5 + 1; // Mock multiplier
-                fetch('/api/aviator/cashout', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId, multiplier: multiplier})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        alert(`Cashed out with $${data.winnings} at ${multiplier.toFixed(2)}x`);
-                        document.getElementById('balance').innerText = `Balance: $${data.new_balance}`;
-                    } else {
-                        alert(data.error);
-                    }
-                });
-            }
-
-            function withdraw() {
-                const amount = parseFloat(document.getElementById('withdrawAmount').value);
-                fetch('/api/aviator/withdraw', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId, amount: amount})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        alert(`Withdrawal of ₦${amount} requested`);
-                        document.getElementById('balance').innerText = `Balance: $${data.new_balance}`;
-                    } else {
-                        alert(data.error);
-                    }
-                });
-            }
-
-            function loadMatches() {
-                fetch(`/api/predictions/available_matches?chat_id=${chatId}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        const select = document.getElementById('matchSelect');
-                        select.innerHTML = '';
-                        data.matches.forEach(match => {
-                            const option = document.createElement('option');
-                            option.value = match.id;
-                            option.text = `${match.home_team} vs ${match.away_team} (${match.date})`;
-                            select.appendChild(option);
-                        });
-                    });
-            }
-
-            function getPrediction() {
-                const matchId = document.getElementById('matchSelect').value;
-                fetch('/api/predictions/get_prediction', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({chat_id: chatId, match_id: matchId})
-                }).then(response => response.json()).then(data => {
-                    if (data.status === 'success') {
-                        document.getElementById('predictionResult').innerText = `Prediction: ${data.prediction.prediction}`;
-                        document.getElementById('balance').innerText = `Balance: $${data.new_balance}`;
-                    } else {
-                        alert(data.error);
-                    }
-                });
-            }
-
-            // Initialize
-            openTab('tapify');
-        </script>
-    </body>
-    </html>
-    '''
 
 # Run Flask app
 def run_flask():
