@@ -7,10 +7,10 @@
 #   python app.py
 #
 # Environment (.env):
-#   BOT_TOKEN=7645079949:AAEkgyy1GTzXXy45LtouLVRaLIGM4g_3WyM
-#   ADMIN_ID=5646269450
+#   BOT_TOKEN=your_bot_token
+#   ADMIN_ID=your_admin_id
 #   WEBAPP_URL=https://tapify.onrender.com/app
-#   DATABASE_URL=postgres://user:pass@internal-host:5432/dbname  # Use Internal DB URL
+#   DATABASE_URL=postgres://user:pass@internal-host:5432/dbname
 #   BANK_ACCOUNTS=FirstBank:1234567890,GTBank:0987654321
 #   FOOTBALL_API_KEY=your_api_key_here
 #   AI_BOOST_LINK=#
@@ -22,12 +22,10 @@ import os
 import sys
 import json
 import hmac
-import base64
 import hashlib
 import logging
 import asyncio
-import typing as t
-from urllib.parse import parse_qsl, quote_plus
+from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone, date
 from collections import deque, defaultdict
 import random
@@ -64,6 +62,9 @@ if not BOT_TOKEN:
     sys.exit(1)
 if not ADMIN_ID:
     print("ERROR: ADMIN_ID is required in environment (.env).", file=sys.stderr)
+    sys.exit(1)
+if not DATABASE_URL:
+    print("ERROR: DATABASE_URL is required in environment (.env).", file=sys.stderr)
     sys.exit(1)
 if not BANK_ACCOUNTS:
     print("WARNING: BANK_ACCOUNTS not set; deposits may fail.", file=sys.stderr)
@@ -107,7 +108,7 @@ def _connect_postgres(url: str):
         log.error(f"Postgres connection failed: {e}")
         raise
 
-def db_execute(query: str, params: t.Tuple = ()):
+def db_execute(query: str, params: tuple = ()):
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -116,7 +117,7 @@ def db_execute(query: str, params: t.Tuple = ()):
         log.error(f"DB execute failed: {query} | Error: {e}")
         raise
 
-def db_fetchone(query: str, params: t.Tuple = ()):
+def db_fetchone(query: str, params: tuple = ()):
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -127,7 +128,7 @@ def db_fetchone(query: str, params: t.Tuple = ()):
         log.error(f"DB fetchone failed: {query} | Error: {e}")
         raise
 
-def db_fetchall(query: str, params: t.Tuple = ()):
+def db_fetchall(query: str, params: tuple = ()):
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -139,18 +140,9 @@ def db_fetchall(query: str, params: t.Tuple = ()):
         raise
 
 def db_init():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL must be set for PostgreSQL")
     global conn
     conn = _connect_postgres(DATABASE_URL)
-    db_execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        chat_id BIGINT PRIMARY KEY,
-        username TEXT,
-        payment_status TEXT DEFAULT NULL,
-        invites INTEGER DEFAULT 0
-    );
-    """)
+    # Ensure game_users table exists
     db_execute("""
     CREATE TABLE IF NOT EXISTS game_users (
         chat_id BIGINT PRIMARY KEY,
@@ -226,7 +218,6 @@ def upsert_user_if_missing(chat_id: int, username: str | None):
 def is_registered(chat_id: int) -> bool:
     try:
         row = db_fetchone("SELECT payment_status FROM users WHERE chat_id = %s", (chat_id,))
-        log.info(f"Checked registration for {chat_id}: {row}")
         if not row:
             log.warning(f"No user found for chat_id {chat_id}")
             return False
@@ -273,7 +264,7 @@ def add_tap(chat_id: int, delta: int, nonce: str):
 
 def leaderboard(range_: str = "all", limit: int = 50):
     if range_ == "all":
-        q = "SELECT u.username, g.chat_id, g.coins AS score FROM game_users g LEFT JOIN users u ON u.chat_id=g.chat_id ORDER BY score DESC LIMIT %s"
+        q = "SELECT u.username, g.chat_id, g.coins AS score FROM game_users g LEFT JOIN users u ON u.chat_id=g.chat_id WHERE u.payment_status = 'registered' ORDER BY score DESC LIMIT %s"
         return db_fetchall(q, (limit,))
     else:
         now = db_now()
@@ -285,7 +276,7 @@ def leaderboard(range_: str = "all", limit: int = 50):
             SELECT u.username, t.chat_id, COALESCE(SUM(t.delta),0) AS score
             FROM game_taps t
             LEFT JOIN users u ON u.chat_id=t.chat_id
-            WHERE t.ts >= %s
+            WHERE t.ts >= %s AND u.payment_status = 'registered'
             GROUP BY t.chat_id, u.username
             ORDER BY score DESC
             LIMIT %s
@@ -358,7 +349,7 @@ def search_matches(query: str):
     matches = get_football_matches()
     query = query.lower().strip()
     if not query:
-        return matches[:10]  # Top 10 if no query
+        return matches[:10]
     return [m for m in matches if query in m["homeTeam"].lower() or query in m["awayTeam"].lower()]
 
 def generate_prediction(match_id):
@@ -586,16 +577,28 @@ async function resolveAuth() {
   }
   USER = out.user;
   LOCKED = !out.allowed;
-  $("#locked").classList.toggle("hidden", out.allowed);
+  $("#locked").classList.toggle("hidden", !out.allowed);
   $("#game").classList.toggle("lock", !out.allowed);
   $("#refLink").value = out.refLink;
   $("#aiLink").href = out.aiLink;
   $("#dailyLink").href = out.dailyLink;
   $("#groupLink").href = out.groupLink;
   $("#siteLink").href = out.siteLink;
-  if (out.allowed) await refreshState();
+  if (out.allowed) {
+    await refreshState();
+    // Ensure UI updates after successful auth
+    $("#locked").classList.add("hidden");
+    $("#game").classList.remove("lock");
+  }
 }
-$("#btnCheck").addEventListener("click", resolveAuth);
+$("#btnCheck").addEventListener("click", async () => {
+  await resolveAuth();
+  if (!LOCKED) {
+    alert("Access granted! You can now play.");
+  } else {
+    alert("Still not registered. Please complete registration in the bot.");
+  }
+});
 async function refreshState() {
   const out = await api("/api/state");
   if (!out.ok) return;
@@ -622,7 +625,7 @@ async function doTap(e) {
   const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(12))));
   const out = await api("/api/tap", { nonce });
   if (!out.ok) {
-    if (out.error) console.log(out.error);
+    if (out.error) alert(out.error);
     return;
   }
   haptics("light");
@@ -895,15 +898,6 @@ def api_leaderboard():
     items = leaderboard(rng, 50)
     return jsonify({"ok": True, "items": items})
 
-@flask_app.get("/api/debug_user/<int:chat_id>")
-def debug_user(chat_id):
-    try:
-        result = db_fetchone("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
-        return jsonify(result or {"error": "User not found"})
-    except Exception as e:
-        log.error(f"Debug user failed for {chat_id}: {e}")
-        return jsonify({"error": str(e)})
-
 @flask_app.post("/api/aviator/bet")
 def api_aviator_bet():
     data = request.get_json(silent=True) or {}
@@ -1055,7 +1049,6 @@ def api_deposit_approve():
     coins = int(gu.get("coins") or 0) + amount
     db_execute("UPDATE deposits SET status = 'approved' WHERE id = %s", (deposit_id,))
     update_game_user_fields(chat_id, {"coins": coins})
-    db_execute("UPDATE users SET payment_status = 'registered' WHERE chat_id = %s", (chat_id,))
     try:
         asyncio.run(bot.send_message(
             chat_id=chat_id,
@@ -1120,7 +1113,7 @@ def api_prediction_request():
     matches = search_matches(query)
     if not matches:
         return jsonify({"ok": False, "error": "Match not available"})
-    match = matches[0]  # Take first match
+    match = matches[0]
     update_game_user_fields(chat_id, {"coins": coins - 500})
     prediction = generate_prediction(match["id"])
     return jsonify({"ok": True, "prediction": prediction})
@@ -1267,7 +1260,7 @@ def _resolve_user_from_init(init_data: str) -> tuple[bool, dict | None, str]:
     chat_id = int(tg_user.get("id"))
     username = tg_user.get("username")
     upsert_user_if_missing(chat_id, username)
-    return True, {"chat_id": chat_id, "username": username}, ""
+    return True, {"chat_id": chan_id, "username": username}, ""
 
 async def main():
     try:
