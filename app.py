@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # app.py — Tapify Game Mini App for Render deployment
 # Requirements:
-#   pip install flask psycopg[binary] python-dotenv uvicorn requests
+#   pip install flask psycopg[binary] python-dotenv uvicorn requests python-telegram-bot==20.7
 #
 # Start:
 #   python app.py
@@ -11,7 +11,7 @@
 #   ADMIN_ID=5646269450
 #   WEBAPP_URL=https://tapify.onrender.com/app
 #   DATABASE_URL=postgres://user:pass@internal-host:5432/dbname  # Use Internal DB URL
-#   BANK_ACCOUNTS=Bank1:1234567890,Bank2:0987654321  # Comma-separated
+#   BANK_ACCOUNTS=FirstBank:1234567890,GTBank:0987654321
 #   FOOTBALL_API_KEY=your_api_key_here
 #   AI_BOOST_LINK=#
 #   DAILY_TASK_LINK=#
@@ -32,12 +32,11 @@ from datetime import datetime, timedelta, timezone, date
 from collections import deque, defaultdict
 import random
 import time
-import requests  # For football API
-
+import requests
 from flask import Flask, request, jsonify, Response
 import uvicorn
 from uvicorn.middleware.wsgi import WSGIMiddleware
-from telegram import Bot  # For admin notifications
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 try:
     from dotenv import load_dotenv
@@ -52,7 +51,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-BANK_ACCOUNTS = os.getenv("BANK_ACCOUNTS", "").strip()  # Format: "Name1:Account1,Name2:Account2"
+BANK_ACCOUNTS = os.getenv("BANK_ACCOUNTS", "").strip()
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "").strip()
 
 AI_BOOST_LINK = os.getenv("AI_BOOST_LINK", "#")
@@ -84,7 +83,7 @@ bot = Bot(token=BOT_TOKEN)
 # --- Database Layer (PostgreSQL only) ------------------
 
 psycopg = None
-conn = None  # type: ignore
+conn = None
 
 def _connect_postgres(url: str):
     global psycopg
@@ -229,8 +228,12 @@ def is_registered(chat_id: int) -> bool:
         row = db_fetchone("SELECT payment_status FROM users WHERE chat_id = %s", (chat_id,))
         log.info(f"Checked registration for {chat_id}: {row}")
         if not row:
+            log.warning(f"No user found for chat_id {chat_id}")
             return False
-        return (row.get("payment_status") or "").lower() == "registered"
+        status = (row.get("payment_status") or "").lower()
+        is_reg = status == "registered"
+        log.info(f"User {chat_id} registration status: {status}, is_registered: {is_reg}")
+        return is_reg
     except Exception as e:
         log.error(f"DB query failed for is_registered {chat_id}: {e}")
         return False
@@ -351,8 +354,14 @@ def get_football_matches():
         log.error(f"Football API error: {e}")
         return []
 
+def search_matches(query: str):
+    matches = get_football_matches()
+    query = query.lower().strip()
+    if not query:
+        return matches[:10]  # Top 10 if no query
+    return [m for m in matches if query in m["homeTeam"].lower() or query in m["awayTeam"].lower()]
+
 def generate_prediction(match_id):
-    # Placeholder: Random prediction (e.g., 60% home win)
     return f"Prediction for match {match_id}: 60% chance of home team win"
 
 # --- Flask App ---
@@ -374,8 +383,64 @@ WEBAPP_HTML = r"""
       background: radial-gradient(1200px 600px at 50% -100px, rgba(255,215,0,0.12), transparent 70%), #0b0f14; 
       font-family: 'Arial', sans-serif;
     }
-    .coin { ... } /* Existing styles unchanged */
-    /* Add plane animation for Aviator */
+    .coin {
+      width: 220px; height: 220px; border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, #ff4500, #8b0000);
+      box-shadow: 0 0 30px rgba(255,69,0,0.6), inset 0 0 20px rgba(255,255,255,0.3);
+      transition: transform 0.1s ease-in-out, box-shadow 0.3s ease;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+      100% { transform: scale(1); }
+    }
+    .coin:active { 
+      transform: scale(0.95); 
+      box-shadow: 0 0 50px rgba(255,69,0,0.8), inset 0 0 40px rgba(255,255,255,0.4); 
+      animation: none;
+    }
+    .glow { filter: drop-shadow(0 0 20px rgba(255,69,0,0.6)); }
+    .tab { 
+      opacity: 0.6; 
+      transition: opacity 0.3s ease, border-bottom 0.3s ease; 
+    }
+    .tab.active { 
+      opacity: 1; 
+      border-bottom: 3px solid #ff4500; 
+      color: #ff4500;
+    }
+    .tab:hover {
+      opacity: 0.9;
+    }
+    .lock { filter: grayscale(0.6); }
+    .boostBtn, .actionBtn {
+      transition: background-color 0.3s ease, transform 0.2s ease;
+    }
+    .boostBtn:hover, .actionBtn:hover {
+      background-color: #ff4500 !important;
+      transform: scale(1.05);
+    }
+    .particle {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: #ff4500;
+      border-radius: 50%;
+      opacity: 0;
+      animation: particle-burst 1s ease-out forwards;
+    }
+    @keyframes particle-burst {
+      0% { transform: translate(0, 0); opacity: 1; }
+      100% { transform: translate(var(--dx), var(--dy)); opacity: 0; }
+    }
+    #balance {
+      animation: balance-update 0.5s ease;
+    }
+    @keyframes balance-update {
+      0% { transform: scale(1.2); color: #ff4500; }
+      100% { transform: scale(1); color: white; }
+    }
     @keyframes fly {
       0% { transform: translateY(0) rotate(45deg); }
       100% { transform: translateY(-200px) rotate(45deg); }
@@ -407,7 +472,7 @@ WEBAPP_HTML = r"""
         <div id="balance" class="text-5xl font-extrabold text-orange-400">0</div>
         <div id="energy" class="mt-1 text-sm opacity-80">⚡ 0 / 0</div>
       </div>
-      <div class="mt-8 grid grid-cols-5 gap-2 text-center text-sm">
+      <div class="mt-8 grid grid-cols-6 gap-2 text-center text-sm">
         <button class="tab active py-2" data-tab="play">Play</button>
         <button class="tab py-2" data-tab="boosts">Boosts</button>
         <button class="tab py-2" data-tab="board">Leaderboard</button>
@@ -418,9 +483,45 @@ WEBAPP_HTML = r"""
       <div id="panelPlay" class="mt-6">
         <button id="dailyRewardBtn" class="px-4 py-2 rounded-lg bg-orange-500 text-black font-semibold w-full mb-4">Claim Daily Reward</button>
       </div>
-      <div id="panelBoosts" class="hidden mt-6 space-y-3"> <!-- Existing Boosts --> </div>
-      <div id="panelBoard" class="hidden mt-6"> <!-- Existing Leaderboard --> </div>
-      <div id="panelRefer" class="hidden mt-6"> <!-- Existing Refer --> </div>
+      <div id="panelBoosts" class="hidden mt-6 space-y-3">
+        <div class="bg-white/5 p-4 rounded-xl shadow-lg">
+          <div class="font-semibold text-orange-400">MultiTap x2 (30m)</div>
+          <div class="text-xs opacity-70 mb-2">Cost: 500</div>
+          <button data-boost="multitap" class="boostBtn px-3 py-2 rounded-lg bg-orange-500 text-black w-full">Activate</button>
+        </div>
+        <div class="bg-white/5 p-4 rounded-xl shadow-lg">
+          <div class="font-semibold text-orange-400">AutoTap (10m)</div>
+          <div class="text-xs opacity-70 mb-2">Cost: 3000</div>
+          <button data-boost="autotap" class="boostBtn px-3 py-2 rounded-lg bg-orange-500 text-black w-full">Activate</button>
+        </div>
+        <div class="bg-white/5 p-4 rounded-xl shadow-lg">
+          <div class="font-semibold text-orange-400">Increase Max Energy +100</div>
+          <div class="text-xs opacity-70 mb-2">Cost: 2500</div>
+          <button data-boost="maxenergy" class="boostBtn px-3 py-2 rounded-lg bg-orange-500 text-black w-full">Upgrade</button>
+        </div>
+      </div>
+      <div id="panelBoard" class="hidden mt-6">
+        <div class="flex gap-2 text-sm">
+          <button class="lbBtn px-3 py-1 rounded bg-white/10" data-range="day">Today</button>
+          <button class="lbBtn px-3 py-1 rounded bg-white/10" data-range="week">This Week</button>
+          <button class="lbBtn px-3 py-1 rounded bg-white/10" data-range="all">All Time</button>
+        </div>
+        <ol id="lbList" class="mt-4 space-y-2"></ol>
+      </div>
+      <div id="panelRefer" class="hidden mt-6">
+        <div class="bg-white/5 p-4 rounded-xl shadow-lg">
+          <div class="font-semibold text-orange-400 mb-1">Invite Friends & Earn!</div>
+          <div class="text-xs opacity-70 mb-2">Share your link to earn bonuses.</div>
+          <input id="refLink" class="w-full px-3 py-2 rounded bg-black/30 border border-white/10" readonly />
+          <button id="copyRef" class="mt-2 px-3 py-2 rounded bg-orange-500 text-black w-full">Copy Link</button>
+        </div>
+        <div class="mt-4 grid grid-cols-2 gap-3 text-sm">
+          <a href="#" id="aiLink" class="text-center bg-white/5 p-3 rounded-lg shadow-lg">AI Boost Task</a>
+          <a href="#" id="dailyLink" class="text-center bg-white/5 p-3 rounded-lg shadow-lg">Daily Task</a>
+          <a href="#" id="groupLink" class="text-center bg-white/5 p-3 rounded-lg shadow-lg">Join Group</a>
+          <a href="#" id="siteLink" class="text-center bg-white/5 p-3 rounded-lg shadow-lg">Visit Site</a>
+        </div>
+      </div>
       <div id="panelAviator" class="hidden mt-6">
         <div class="bg-white/5 p-4 rounded-xl shadow-lg text-center">
           <div id="plane" class="w-20 h-20 mx-auto bg-orange-500 rotate-45 mb-4"></div>
@@ -429,8 +530,8 @@ WEBAPP_HTML = r"""
           <button id="placeBet" class="mt-2 px-3 py-2 rounded bg-orange-500 text-black w-full">Place Bet</button>
           <button id="cashOut" class="mt-2 px-3 py-2 rounded bg-green-500 text-black w-full hidden">Cash Out</button>
           <div class="mt-4">
-            <button id="fundBtn" class="px-3 py-1 rounded bg-blue-500 text-white">Fund Account</button>
-            <button id="withdrawBtn" class="ml-2 px-3 py-1 rounded bg-red-500 text-white">Withdraw</button>
+            <button id="fundBtn" class="actionBtn px-3 py-1 rounded bg-blue-500 text-white">Fund Account</button>
+            <button id="withdrawBtn" class="actionBtn ml-2 px-3 py-1 rounded bg-red-500 text-white">Withdraw</button>
           </div>
         </div>
       </div>
@@ -502,7 +603,72 @@ async function refreshState() {
   $("#energy").textContent = `⚡ ${out.energy} / ${out.max_energy}`;
   $("#streak").textContent = `🔥 Streak: ${out.daily_streak || 0}`;
 }
-// ... existing JS for tap, boosts, leaderboard, refer ...
+function createParticles(x, y, count = 10) {
+  for (let i = 0; i < count; i++) {
+    const particle = document.createElement('div');
+    particle.className = 'particle';
+    particle.style.left = `${x}px`;
+    particle.style.top = `${y}px`;
+    const angle = Math.random() * 2 * Math.PI;
+    const dist = Math.random() * 50 + 20;
+    particle.style.setProperty('--dx', `${Math.cos(angle) * dist}px`);
+    particle.style.setProperty('--dy', `${Math.sin(angle) * dist}px`);
+    document.body.appendChild(particle);
+    setTimeout(() => particle.remove(), 1000);
+  }
+}
+async function doTap(e) {
+  if (LOCKED) return;
+  const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(12))));
+  const out = await api("/api/tap", { nonce });
+  if (!out.ok) {
+    if (out.error) console.log(out.error);
+    return;
+  }
+  haptics("light");
+  $("#balance").textContent = out.coins;
+  $("#balance").style.animation = 'balance-update 0.5s ease';
+  setTimeout(() => $("#balance").style.animation = '', 500);
+  $("#energy").textContent = `⚡ ${out.energy} / ${out.max_energy}`;
+  const rect = $("#tapBtn").getBoundingClientRect();
+  createParticles(rect.left + rect.width / 2, rect.top + rect.height / 2);
+}
+$("#tapBtn").addEventListener("click", doTap);
+$$(".boostBtn").forEach(b => {
+  b.addEventListener("click", async () => {
+    const out = await api("/api/boost", { name: b.dataset.boost });
+    if (out.ok) { await refreshState(); haptics("medium"); }
+    else if (out.error) alert(out.error);
+  });
+});
+$$(".lbBtn").forEach(b => {
+  b.addEventListener("click", async () => {
+    RANGE = b.dataset.range;
+    const q = await fetch(`/api/leaderboard?range=${RANGE}`);
+    const data = await q.json();
+    const list = $("#lbList"); list.innerHTML = "";
+    (data.items || []).forEach((r, i) => {
+      const li = document.createElement("li");
+      li.className = "flex justify-between bg-white/5 px-3 py-2 rounded-lg shadow-md";
+      li.innerHTML = `<div>#${i+1} @${r.username || r.chat_id}</div><div>${r.score}</div>`;
+      list.appendChild(li);
+    });
+  });
+});
+$("#copyRef").addEventListener("click", () => {
+  navigator.clipboard.writeText($("#refLink").value);
+  haptics("light");
+});
+$("#dailyRewardBtn").addEventListener("click", async () => {
+  const out = await api("/api/daily_reward");
+  if (out.ok) {
+    await refreshState();
+    haptics("medium");
+    alert("Claimed 100 coins!");
+  } else if (out.error) {
+    alert(out.error);
+  }
+});
 let aviatorInterval;
 $("#placeBet").addEventListener("click", async () => {
   const amount = parseInt($("#betAmount").value);
@@ -558,11 +724,16 @@ $("#withdrawBtn").addEventListener("click", async () => {
   else alert(out.error);
 });
 async function loadMatches() {
-  const out = await api("/api/prediction/matches");
+  const query = $("#matchSearch").value;
+  const out = await api("/api/prediction/matches", {query});
   const list = $("#matchList");
   list.innerHTML = "";
   if (!out.ok) {
     list.innerHTML = `<div class="text-red-500">${out.error}</div>`;
+    return;
+  }
+  if (out.matches.length === 0) {
+    list.innerHTML = `<div class="text-yellow-500">No matches found</div>`;
     return;
   }
   out.matches.forEach(m => {
@@ -605,6 +776,527 @@ def api_auth_resolve():
     data = request.get_json(silent=True) or {}
     init_data = data.get("initData", "")
     ok, user, err = _resolve_user_from_init(init_data)
-    if notarında
+    if not ok:
+        return jsonify({"ok": False, "error": err})
+    chat_id = user["chat_id"]
+    allowed = is_registered(chat_id)
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{chat_id}" if BOT_USERNAME else ""
+    return jsonify({
+        "ok": True,
+        "user": user,
+        "allowed": allowed,
+        "refLink": ref_link,
+        "aiLink": AI_BOOST_LINK,
+        "dailyLink": DAILY_TASK_LINK,
+        "groupLink": GROUP_LINK,
+        "siteLink": SITE_LINK,
+    })
 
-System: * Today's date and time is 04:32 AM WAT on Thursday, August 21, 2025.
+@flask_app.post("/api/state")
+def api_state():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    gu = get_game_user(chat_id)
+    energy, energy_ts = compute_energy(gu)
+    out = {
+        "ok": True,
+        "coins": int(gu.get("coins") or 0),
+        "energy": energy,
+        "max_energy": int(gu.get("max_energy") or 500),
+        "daily_streak": int(gu.get("daily_streak") or 0),
+    }
+    update_game_user_fields(chat_id, {"energy": energy, "energy_updated_at": energy_ts})
+    return jsonify(out)
+
+@flask_app.post("/api/boost")
+def api_boost():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    name = data.get("name", "")
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    ok, msg = activate_boost(chat_id, name)
+    return jsonify({"ok": ok, "error": None if ok else msg})
+
+@flask_app.post("/api/tap")
+def api_tap():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    nonce = data.get("nonce", "")
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    if not can_tap_now(chat_id):
+        return jsonify({"ok": False, "error": "Rate limited"})
+    if not nonce or len(nonce) > 200:
+        return jsonify({"ok": False, "error": "Bad nonce"})
+    if nonce in _recent_nonces[chat_id]:
+        return jsonify({"ok": False, "error": "Replay blocked"})
+    _recent_nonces[chat_id].add(nonce)
+    _clean_old_nonces(chat_id)
+    gu = get_game_user(chat_id)
+    energy, energy_ts = compute_energy(gu)
+    if energy < 1:
+        return jsonify({"ok": False, "error": "No energy", "coins": int(gu.get("coins") or 0),
+                        "energy": energy, "max_energy": int(gu.get("max_energy") or 500)})
+    mult = boost_multiplier(gu)
+    delta = 2 * mult
+    add_tap(chat_id, delta, nonce)
+    update_game_user_fields(chat_id, {"energy": energy - 1, "energy_updated_at": energy_ts})
+    new_streak, streak_date = streak_update(gu, tapped_today=True)
+    update_game_user_fields(chat_id, {"daily_streak": new_streak, "last_streak_at": streak_date})
+    gu2 = get_game_user(chat_id)
+    energy2, _ = compute_energy(gu2)
+    return jsonify({
+        "ok": True,
+        "coins": int(gu2.get("coins") or 0),
+        "energy": energy2,
+        "max_energy": int(gu2.get("max_energy") or 500),
+    })
+
+@flask_app.post("/api/daily_reward")
+def api_daily_reward():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    gu = get_game_user(chat_id)
+    last_reward = gu.get("last_daily_reward")
+    today = db_date_utc()
+    if last_reward and (isinstance(last_reward, str) and last_reward == today.isoformat() or
+                        isinstance(last_reward, date) and last_reward == today):
+        return jsonify({"ok": False, "error": "Already claimed today"})
+    coins = int(gu.get("coins") or 0) + 100
+    update_game_user_fields(chat_id, {"coins": coins, "last_daily_reward": today})
+    return jsonify({"ok": True, "coins": coins})
+
+@flask_app.get("/api/leaderboard")
+def api_leaderboard():
+    rng = request.args.get("range", "all")
+    if rng not in ("day", "week", "all"):
+        rng = "all"
+    items = leaderboard(rng, 50)
+    return jsonify({"ok": True, "items": items})
+
+@flask_app.get("/api/debug_user/<int:chat_id>")
+def debug_user(chat_id):
+    try:
+        result = db_fetchone("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
+        return jsonify(result or {"error": "User not found"})
+    except Exception as e:
+        log.error(f"Debug user failed for {chat_id}: {e}")
+        return jsonify({"error": str(e)})
+
+@flask_app.post("/api/aviator/bet")
+def api_aviator_bet():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    bet_amount = data.get("amount", 0)
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    gu = get_game_user(chat_id)
+    coins = int(gu.get("coins") or 0)
+    if bet_amount <= 0 or bet_amount > coins:
+        return jsonify({"ok": False, "error": "Invalid bet"})
+    update_game_user_fields(chat_id, {"coins": coins - bet_amount})
+    crash_point = generate_crash_point()
+    aviator_games[chat_id] = {'bet': bet_amount, 'start_time': time.time(), 'cashed_out': False, 'crash_point': crash_point}
+    return jsonify({"ok": True, "started": True})
+
+@flask_app.post("/api/aviator/state")
+def api_aviator_state():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if chat_id not in aviator_games:
+        return jsonify({"ok": True, "active": False})
+    game = aviator_games[chat_id]
+    multiplier = get_aviator_multiplier(game['start_time'])
+    crashed = multiplier >= game['crash_point']
+    if crashed and not game['cashed_out']:
+        del aviator_games[chat_id]
+        return jsonify({"ok": True, "active": False, "crashed": True, "winnings": 0})
+    return jsonify({"ok": True, "active": True, "multiplier": round(multiplier, 2), "crashed": crashed})
+
+@flask_app.post("/api/aviator/cashout")
+def api_aviator_cashout():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if chat_id not in aviator_games:
+        return jsonify({"ok": False, "error": "No active game"})
+    game = aviator_games[chat_id]
+    if game['cashed_out']:
+        return jsonify({"ok": False, "error": "Already cashed out"})
+    multiplier = get_aviator_multiplier(game['start_time'])
+    if multiplier >= game['crash_point']:
+        del aviator_games[chat_id]
+        return jsonify({"ok": False, "error": "Crashed", "winnings": 0})
+    winnings = int(game['bet'] * multiplier)
+    gu = get_game_user(chat_id)
+    coins = int(gu.get("coins") or 0) + winnings
+    update_game_user_fields(chat_id, {"coins": coins})
+    game['cashed_out'] = True
+    del aviator_games[chat_id]
+    return jsonify({"ok": True, "winnings": winnings})
+
+@flask_app.post("/api/aviator/withdraw")
+def api_aviator_withdraw():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    amount = data.get("amount", 0)
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    if amount < 50000:
+        return jsonify({"ok": False, "error": "Minimum withdrawal 50,000 Naira"})
+    gu = get_game_user(chat_id)
+    coins = int(gu.get("coins") or 0)
+    if amount > coins:
+        return jsonify({"ok": False, "error": "Insufficient balance"})
+    db_execute("INSERT INTO withdrawals (chat_id, amount) VALUES (%s, %s)", (chat_id, amount))
+    try:
+        asyncio.run(bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"Withdrawal request from @{auth['user'].get('username', chat_id)}: {amount} Naira",
+        ))
+    except Exception as e:
+        log.error(f"Failed to notify admin for withdrawal {chat_id}: {e}")
+    return jsonify({"ok": True, "message": "Withdrawal requested, awaiting approval"})
+
+@flask_app.get("/api/deposit/accounts")
+def api_deposit_accounts():
+    if not BANK_ACCOUNTS:
+        return jsonify({"ok": False, "error": "No bank accounts configured"})
+    accounts = [acc.strip() for acc in BANK_ACCOUNTS.split(",")]
+    return jsonify({"ok": True, "accounts": accounts})
+
+@flask_app.post("/api/deposit/request")
+def api_deposit_request():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    amount = data.get("amount", 0)
+    bank_account = data.get("bank", "").strip()
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    if amount < 1000:
+        return jsonify({"ok": False, "error": "Minimum deposit 1000 Naira"})
+    accounts = [acc.strip() for acc in BANK_ACCOUNTS.split(",")]
+    if bank_account not in accounts:
+        return jsonify({"ok": False, "error": "Invalid bank account"})
+    db_execute("INSERT INTO deposits (chat_id, amount, bank_account) VALUES (%s, %s, %s)", 
+               (chat_id, amount, bank_account))
+    deposit_id = db_fetchone("SELECT id FROM deposits WHERE chat_id = %s ORDER BY requested_at DESC LIMIT 1", (chat_id,))["id"]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Approve", callback_data=f"deposit_approve_{deposit_id}_{chat_id}_{amount}"),
+            InlineKeyboardButton("Reject", callback_data=f"deposit_reject_{deposit_id}_{chat_id}")
+        ]
+    ])
+    try:
+        asyncio.run(bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"Deposit request from @{auth['user'].get('username', chat_id)}: {amount} Naira to {bank_account}",
+            reply_markup=keyboard
+        ))
+    except Exception as e:
+        log.error(f"Failed to notify admin for deposit {chat_id}: {e}")
+    return jsonify({"ok": True, "message": "Deposit requested, please make payment and await approval"})
+
+@flask_app.post("/api/deposit/approve")
+def api_deposit_approve():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    deposit_id = data.get("deposit_id", 0)
+    chat_id = data.get("chat_id", 0)
+    amount = data.get("amount", 0)
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user") or int(auth["user"]["id"]) != ADMIN_ID:
+        return jsonify({"ok": False, "error": "Unauthorized"})
+    deposit = db_fetchone("SELECT * FROM deposits WHERE id = %s AND chat_id = %s AND status = 'pending'", 
+                         (deposit_id, chat_id))
+    if not deposit:
+        return jsonify({"ok": False, "error": "Invalid or already processed deposit"})
+    gu = get_game_user(chat_id)
+    coins = int(gu.get("coins") or 0) + amount
+    db_execute("UPDATE deposits SET status = 'approved' WHERE id = %s", (deposit_id,))
+    update_game_user_fields(chat_id, {"coins": coins})
+    db_execute("UPDATE users SET payment_status = 'registered' WHERE chat_id = %s", (chat_id,))
+    try:
+        asyncio.run(bot.send_message(
+            chat_id=chat_id,
+            text=f"Your deposit of {amount} Naira has been approved! Balance updated."
+        ))
+    except Exception as e:
+        log.error(f"Failed to notify user {chat_id} for deposit approval: {e}")
+    return jsonify({"ok": True})
+
+@flask_app.post("/api/deposit/reject")
+def api_deposit_reject():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    deposit_id = data.get("deposit_id", 0)
+    chat_id = data.get("chat_id", 0)
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user") or int(auth["user"]["id"]) != ADMIN_ID:
+        return jsonify({"ok": False, "error": "Unauthorized"})
+    deposit = db_fetchone("SELECT * FROM deposits WHERE id = %s AND chat_id = %s AND status = 'pending'", 
+                         (deposit_id, chat_id))
+    if not deposit:
+        return jsonify({"ok": False, "error": "Invalid or already processed deposit"})
+    db_execute("UPDATE deposits SET status = 'rejected' WHERE id = %s", (deposit_id,))
+    try:
+        asyncio.run(bot.send_message(
+            chat_id=chat_id,
+            text="Your deposit request was rejected. Please contact support."
+        ))
+    except Exception as e:
+        log.error(f"Failed to notify user {chat_id} for deposit rejection: {e}")
+    return jsonify({"ok": True})
+
+@flask_app.post("/api/prediction/matches")
+def api_prediction_matches():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    query = data.get("query", "").strip()
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    matches = search_matches(query)
+    return jsonify({"ok": True, "matches": matches})
+
+@flask_app.post("/api/prediction/request")
+def api_prediction_request():
+    data = request.get_json(silent=True) or {}
+    init_data = data.get("initData", "")
+    query = data.get("query", "").strip()
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return jsonify({"ok": False, "error": "Invalid auth"})
+    chat_id = int(auth["user"]["id"])
+    if not is_registered(chat_id):
+        return jsonify({"ok": False, "error": "Not registered"})
+    gu = get_game_user(chat_id)
+    coins = int(gu.get("coins") or 0)
+    if coins < 500:
+        return jsonify({"ok": False, "error": "Need 500 coins for prediction"})
+    matches = search_matches(query)
+    if not matches:
+        return jsonify({"ok": False, "error": "Match not available"})
+    match = matches[0]  # Take first match
+    update_game_user_fields(chat_id, {"coins": coins - 500})
+    prediction = generate_prediction(match["id"])
+    return jsonify({"ok": True, "prediction": prediction})
+
+# --- Bot Username Setup ---
+BOT_USERNAME = ""
+
+async def set_bot_username():
+    global BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+        log.info("Bot username: @%s", BOT_USERNAME)
+    except Exception as e:
+        log.error(f"Failed to get bot username: {e}")
+
+# --- Helper Functions ---
+MAX_TAPS_PER_SEC = 20
+RATE_WINDOW_SEC = 1.0
+
+_rate_windows: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=MAX_TAPS_PER_SEC * 3))
+_recent_nonces: dict[int, set[str]] = defaultdict(set)
+
+def _clean_old_nonces(chat_id: int):
+    s = _recent_nonces[chat_id]
+    if len(s) > 200:
+        _recent_nonces[chat_id] = set(list(s)[-100:])
+
+def can_tap_now(chat_id: int) -> bool:
+    now = time.monotonic()
+    dq = _rate_windows[chat_id]
+    while dq and now - dq[0] > RATE_WINDOW_SEC:
+        dq.popleft()
+    if len(dq) >= MAX_TAPS_PER_SEC:
+        return False
+    dq.append(now)
+    return True
+
+def compute_energy(user_row: dict) -> tuple[int, datetime]:
+    max_energy = int(user_row.get("max_energy") or 500)
+    regen_rate_seconds = int(user_row.get("regen_rate_seconds") or 3)
+    raw = user_row.get("energy_updated_at")
+    if isinstance(raw, str):
+        try:
+            last = datetime.fromisoformat(raw)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+        except Exception:
+            last = db_now()
+    else:
+        last = raw or db_now()
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+    stored_energy = int(user_row.get("energy") or 0)
+    now = db_now()
+    elapsed = int((now - last).total_seconds())
+    regen = elapsed // max(1, regen_rate_seconds)
+    energy = min(max_energy, stored_energy + regen)
+    if regen > 0:
+        last = last + timedelta(seconds=regen * regen_rate_seconds)
+    return energy, last
+
+def streak_update(gu: dict, tapped_today: bool) -> tuple[int, date]:
+    today = db_date_utc()
+    last_str = gu.get("last_streak_at")
+    last_date: date | None = None
+    if isinstance(last_str, str) and last_str:
+        try:
+            last_date = datetime.fromisoformat(last_str).date()
+        except Exception:
+            last_date = None
+    elif isinstance(last_str, datetime):
+        last_date = last_str.date()
+    elif isinstance(last_str, date):
+        last_date = last_str
+    streak = int(gu.get("daily_streak") or 0)
+    if not tapped_today:
+        return streak, last_date or today
+    if last_date == today - timedelta(days=1):
+        streak += 1
+    elif last_date == today:
+        pass
+    else:
+        streak = 1
+    return streak, today
+
+def boost_multiplier(gu: dict) -> int:
+    mult = 1
+    mt = gu.get("multitap_until")
+    at = gu.get("autotap_until")
+    now = db_now()
+    if isinstance(mt, str) and mt:
+        try: mt = datetime.fromisoformat(mt)
+        except: mt = None
+    if isinstance(at, str) and at:
+        try: at = datetime.fromisoformat(at)
+        except: at = None
+    if isinstance(mt, datetime) and mt.replace(tzinfo=timezone.utc) > now:
+        mult = max(mult, 2)
+    if isinstance(at, datetime) and at.replace(tzinfo=timezone.utc) > now:
+        mult = max(mult, 2)
+    return mult
+
+def activate_boost(chat_id: int, boost: str) -> tuple[bool, str]:
+    gu = get_game_user(chat_id)
+    coins = int(gu.get("coins") or 0)
+    now = db_now()
+    cost = 0
+    field = None
+    duration = timedelta(minutes=15)
+    if boost == "multitap":
+        cost = 500
+        field = "multitap_until"
+        duration = timedelta(minutes=30)
+    elif boost == "autotap":
+        cost = 3000
+        field = "autotap_until"
+        duration = timedelta(minutes=10)
+    elif boost == "maxenergy":
+        cost = 2500
+        if coins < cost:
+            return False, "Not enough coins"
+        update_game_user_fields(chat_id, {
+            "coins": coins - cost,
+            "max_energy": int(gu.get("max_energy") or 500) + 100
+        })
+        return True, "Max energy increased by +100!"
+    else:
+        return False, "Unknown boost"
+    if coins < cost:
+        return False, "Not enough coins"
+    until = now + duration
+    update_game_user_fields(chat_id, {
+        "coins": coins - cost,
+        field: until
+    })
+    return True, f"{boost} activated!"
+
+def _resolve_user_from_init(init_data: str) -> tuple[bool, dict | None, str]:
+    auth = verify_init_data(init_data, BOT_TOKEN)
+    if not auth or not auth.get("user"):
+        return False, None, "Invalid auth"
+    tg_user = auth["user"]
+    chat_id = int(tg_user.get("id"))
+    username = tg_user.get("username")
+    upsert_user_if_missing(chat_id, username)
+    return True, {"chat_id": chat_id, "username": username}, ""
+
+async def main():
+    try:
+        db_init()
+        await set_bot_username()
+        print_checklist()
+        log.info("Starting Flask via uvicorn on 0.0.0.0:%s", PORT)
+        config = uvicorn.Config(
+            WSGIMiddleware(flask_app),
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info",
+            lifespan="off"
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+    except Exception as e:
+        log.error("Startup failed: %s", e)
+        sys.exit(1)
+
+def print_checklist():
+    print("=== Tapify Startup Checklist ===")
+    print(f"BOT_TOKEN: {'OK' if BOT_TOKEN else 'MISSING'}")
+    print(f"ADMIN_ID:  {ADMIN_ID if ADMIN_ID else 'MISSING'}")
+    print(f"DB:        {'Postgres' if DATABASE_URL else 'MISSING'}")
+    print(f"WEBAPP:    {WEBAPP_URL or '(derive from host)'}")
+    print(f"BANK_ACCOUNTS: {'OK' if BANK_ACCOUNTS else 'MISSING'}")
+    print(f"FOOTBALL_API_KEY: {'OK' if FOOTBALL_API_KEY else 'MISSING'}")
+    print("================================")
+
+if __name__ == "__main__":
+    asyncio.run(main())
