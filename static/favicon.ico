@@ -1,3 +1,0 @@
-@flask_app.route('/favicon.ico')
-def favicon():
-    return flask_app.send_static_file('favicon.ico')
