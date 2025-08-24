@@ -208,6 +208,11 @@ def api_tap():
 # --------------------
 # API — Walk & Earn
 # --------------------
+
+@app.route("/app")
+def app_entry():
+    return index()
+
 @app.post("/api/steps")
 def api_steps():
     user = get_or_create_user_from_query()
