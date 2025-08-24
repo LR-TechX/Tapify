@@ -244,22 +244,7 @@ def app_entry():
     if request.method == "HEAD":
         return "", 200
 
-    return render_template_string("""
-    <html>
-    <head><title>Tapify Game</title></head>
-    <body>
-      <h1>Welcome {{user.username}}!</h1>
-      <p>Balance: ${{user.balance_usd}} / ₦{{user.balance_ngn}}</p>
-      <ul>
-        <li><a href="/tap?chat_id={{user.chat_id}}">Tap Coin</a></li>
-        <li><a href="/aviator?chat_id={{user.chat_id}}">Aviator</a></li>
-        <li><a href="/walk?chat_id={{user.chat_id}}">Walk & Earn</a></li>
-        <li><a href="/wallet?chat_id={{user.chat_id}}">Wallet</a></li>
-      </ul>
-    </body>
-
-    </html>
-    """, user=user)
+    return render_template_string()
 
 @app.post("/api/steps")
 def api_steps():
@@ -751,6 +736,7 @@ def index():
         BASE_HTML,
         tap_reward=f"{TAP_REWARD}",
         max_tap=MAX_TAP_PER_REQUEST,
+        user=user,
     )
 
 
