@@ -736,7 +736,7 @@ def index():
         BASE_HTML,
         tap_reward=f"{TAP_REWARD}",
         max_tap=MAX_TAP_PER_REQUEST,
-        user=user,
+        username=user.username or user.chat_id,
     )
 
 
