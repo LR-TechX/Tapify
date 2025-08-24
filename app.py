@@ -1,16 +1,16 @@
-# app.py — Tapify WebApp (Flask, single-file)
-# -------------------------------------------
+# app.py — Tapify WebApp (Flask, Postgres-only, single-file)
+# ----------------------------------------------------------
 # Features
 # - Tap Coin (Notcoin/Hamster-style)
-# - Aviator game (Sportybet vibe)
+# - Aviator game (Sporty UI)
 # - Walk & Earn (motion + manual, upgrades)
-# - Wallet: Deposit (admin approval in bot) + Withdraw (holds funds until approval)
-# - Shared DB with bot via DATABASE_URL; signup bonus $8 (₦8000)
-# - Simple Tailwind UI in a single file
+# - Wallet: Deposit (admin approval in bot) + Withdraw (funds held until approval)
+# - Uses chat_id as the user key everywhere (no numeric user.id)
+# - Signup bonus $8 (₦8000) on first visit
+# - Tailwind UI in a single file
 
 import os
 import json
-import math
 import random
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -18,20 +18,20 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 from flask import Flask, request, jsonify, render_template_string, abort
 from flask_sqlalchemy import SQLAlchemy
 
-getcontext().prec = 28
-
 # --------------------
 # Config
 # --------------------
-DEFAULT_DB = "sqlite:///app.db"  # Local fallback
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB)
-SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-change-me")
-USD_TO_NGN = Decimal("1000")  # Project mapping: $8 == ₦8000
+getcontext().prec = 28
 
-# Game economics
-TAP_REWARD = Decimal("0.001")
+# Force Postgres only (no SQLite fallback)
+DATABASE_URL = os.environ["DATABASE_URL"]
+SECRET_KEY = os.environ["SECRET_KEY"]
+
+USD_TO_NGN = Decimal("1000")      # Project mapping: $8 == ₦8000
+TAP_REWARD = Decimal("0.001")     # per tap
 MAX_TAP_PER_REQUEST = 50
 
+# Walk upgrades (level -> {rate per step, price})
 WALK_UPGRADES = {
     1: {"rate": Decimal("0.01"), "price": Decimal("0.00")},
     2: {"rate": Decimal("0.02"), "price": Decimal("5.00")},
@@ -39,22 +39,22 @@ WALK_UPGRADES = {
     4: {"rate": Decimal("0.10"), "price": Decimal("40.00")},
 }
 
+# Aviator parameters
 AVIATOR_GROWTH_PER_SEC = Decimal("0.25")
 MIN_BET = Decimal("0.10")
-MAX_BET = Decimal("1000")
+MAX_BET = Decimal("1000.00")
 
+# Wallet params
 MIN_DEPOSIT = Decimal("1.00")
 MIN_WITHDRAW = Decimal("5.00")
 
-# --------------------
-# Helpers
-# --------------------
 
 def to_cents(x: Decimal) -> Decimal:
     return Decimal(x).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 
 def sample_crash_multiplier() -> Decimal:
+    """Heavy-tailed crash multiplier."""
     r = random.random()
     if r < 0.80:
         return Decimal(str(round(random.uniform(1.10, 3.0), 2)))
@@ -78,12 +78,12 @@ db = SQLAlchemy(app)
 
 
 # --------------------
-# Models
+# Models (chat_id is the key)
 # --------------------
 class User(db.Model):
     __tablename__ = "users"
-    id = db.Column(db.Integer, primary_key=True)
-    chat_id = db.Column(db.String(128), unique=True, index=True, nullable=False)
+    # IMPORTANT: chat_id is the primary key (no integer id)
+    chat_id = db.Column(db.BigInteger, primary_key=True)
     username = db.Column(db.String(128))
 
     balance_usd = db.Column(db.Numeric(18, 2), default=Decimal("0.00"))
@@ -105,24 +105,26 @@ class User(db.Model):
             self.walk_level = 1; changed = True
         if not self.walk_rate:
             self.walk_rate = Decimal("0.01"); changed = True
+        if self.total_steps is None:
+            self.total_steps = 0; changed = True
         return changed
 
 
 class Tx(db.Model):
     __tablename__ = "transactions"
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"), nullable=False)
     type = db.Column(db.String(64), nullable=False)  # tap, walk, aviator_bet, aviator_cashout, upgrade, deposit, withdraw, withdraw_revert, signup_bonus
     status = db.Column(db.String(32), default="approved")  # approved|pending|rejected
     amount_usd = db.Column(db.Numeric(18, 2), nullable=False)
-    meta = db.Column(db.JSON)  # {ref/method, payout, etc}
+    meta = db.Column(db.JSON)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class AviatorRound(db.Model):
     __tablename__ = "aviator_rounds"
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"), nullable=False)
     bet_usd = db.Column(db.Numeric(18, 2), nullable=False)
     start_time = db.Column(db.DateTime(timezone=True), nullable=False)
     crash_multiplier = db.Column(db.Numeric(18, 2), nullable=False)
@@ -141,23 +143,27 @@ with app.app_context():
 # --------------------
 # User helper
 # --------------------
-
 def get_or_create_user_from_query():
-    chat_id = request.args.get("chat_id") or request.headers.get("X-Chat-Id")
-    username = request.args.get("username")
+    chat_id = request.args.get("chat_id") or request.headers.get("X-Chat-Id") or (request.json or {}).get("chat_id")
+    username = request.args.get("username") or (request.json or {}).get("username")
     if not chat_id:
         abort(400, "Missing chat_id. Launch from Telegram WebApp button or append ?chat_id=...")
 
-    user = User.query.filter_by(chat_id=str(chat_id)).first()
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        abort(400, "chat_id must be numeric")
+
+    user = User.query.get(chat_id)
     if not user:
-        user = User(chat_id=str(chat_id), username=username)
+        user = User(chat_id=chat_id, username=username)
         user.ensure_defaults()
         # Signup bonus
         user.balance_usd = Decimal("8.00")
         user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
         db.session.add(user)
         db.session.flush()
-        db.session.add(Tx(user_id=user.id, type="signup_bonus", status="approved", amount_usd=Decimal("8.00"), meta={"ngn": str(user.balance_ngn)}))
+        db.session.add(Tx(chat_id=user.chat_id, type="signup_bonus", status="approved", amount_usd=Decimal("8.00"), meta={"ngn": str(user.balance_ngn)}))
         db.session.commit()
     else:
         if user.ensure_defaults():
@@ -188,12 +194,13 @@ def api_user():
 @app.post("/api/tap")
 def api_tap():
     user = get_or_create_user_from_query()
-    count = int(request.json.get("count", 1))
+    body = request.get_json(silent=True) or {}
+    count = int(body.get("count", 1))
     count = max(1, min(count, MAX_TAP_PER_REQUEST))
     earn = to_cents(TAP_REWARD * Decimal(count))
     user.balance_usd = to_cents(Decimal(user.balance_usd) + earn)
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
-    db.session.add(Tx(user_id=user.id, type="tap", status="approved", amount_usd=earn, meta={"count": count}))
+    db.session.add(Tx(chat_id=user.chat_id, type="tap", status="approved", amount_usd=earn, meta={"count": count}))
     db.session.commit()
     return jsonify({"ok": True, "earned_usd": str(earn), "balance_usd": str(user.balance_usd), "balance_ngn": str(user.balance_ngn)})
 
@@ -204,14 +211,15 @@ def api_tap():
 @app.post("/api/steps")
 def api_steps():
     user = get_or_create_user_from_query()
-    steps = int(request.json.get("steps", 0))
+    body = request.get_json(silent=True) or {}
+    steps = int(body.get("steps", 0))
     if steps <= 0:
         return jsonify({"ok": False, "error": "steps must be positive"}), 400
     earn = to_cents(Decimal(user.walk_rate) * Decimal(steps))
     user.total_steps = int(user.total_steps or 0) + steps
     user.balance_usd = to_cents(Decimal(user.balance_usd) + earn)
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
-    db.session.add(Tx(user_id=user.id, type="walk", status="approved", amount_usd=earn, meta={"steps": steps, "rate": str(user.walk_rate)}))
+    db.session.add(Tx(chat_id=user.chat_id, type="walk", status="approved", amount_usd=earn, meta={"steps": steps, "rate": str(user.walk_rate)}))
     db.session.commit()
     return jsonify({"ok": True, "earned_usd": str(earn), "balance_usd": str(user.balance_usd), "balance_ngn": str(user.balance_ngn), "total_steps": int(user.total_steps)})
 
@@ -219,7 +227,8 @@ def api_steps():
 @app.post("/api/upgrade")
 def api_upgrade():
     user = get_or_create_user_from_query()
-    target = int(request.json.get("target_level", 0))
+    body = request.get_json(silent=True) or {}
+    target = int(body.get("target_level", 0))
     if target <= user.walk_level:
         return jsonify({"ok": False, "error": "Target must be higher than current level"}), 400
     if target not in WALK_UPGRADES:
@@ -237,7 +246,7 @@ def api_upgrade():
     user.walk_rate = WALK_UPGRADES[target]["rate"]
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
 
-    db.session.add(Tx(user_id=user.id, type="upgrade", status="approved", amount_usd=-to_cents(total_cost), meta={"new_level": target, "new_rate": str(user.walk_rate)}))
+    db.session.add(Tx(chat_id=user.chat_id, type="upgrade", status="approved", amount_usd=-to_cents(total_cost), meta={"new_level": target, "new_rate": str(user.walk_rate)}))
     db.session.commit()
     return jsonify({"ok": True, "balance_usd": str(user.balance_usd), "walk_level": user.walk_level, "walk_rate": str(user.walk_rate)})
 
@@ -248,7 +257,8 @@ def api_upgrade():
 @app.post("/api/aviator/start")
 def api_aviator_start():
     user = get_or_create_user_from_query()
-    bet = Decimal(str(request.json.get("bet", "0")))
+    body = request.get_json(silent=True) or {}
+    bet = Decimal(str(body.get("bet", "0")))
     if bet < MIN_BET or bet > MAX_BET:
         return jsonify({"ok": False, "error": f"Bet must be between {MIN_BET} and {MAX_BET}"}), 400
     if Decimal(user.balance_usd) < bet:
@@ -258,7 +268,7 @@ def api_aviator_start():
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
 
     round_obj = AviatorRound(
-        user_id=user.id,
+        chat_id=user.chat_id,
         bet_usd=to_cents(bet),
         start_time=datetime.now(timezone.utc),
         crash_multiplier=sample_crash_multiplier(),
@@ -266,7 +276,7 @@ def api_aviator_start():
         status="active",
     )
     db.session.add(round_obj)
-    db.session.add(Tx(user_id=user.id, type="aviator_bet", status="approved", amount_usd=-to_cents(bet), meta={}))
+    db.session.add(Tx(chat_id=user.chat_id, type="aviator_bet", status="approved", amount_usd=-to_cents(bet), meta={}))
     db.session.commit()
     return jsonify({"ok": True, "round_id": round_obj.id, "bet": str(round_obj.bet_usd)})
 
@@ -285,12 +295,11 @@ def _aviator_state(round_obj: AviatorRound):
 def api_aviator_state():
     user = get_or_create_user_from_query()
     round_id = request.args.get("round_id")
-    r = AviatorRound.query.filter_by(id=round_id, user_id=user.id).first()
+    r = AviatorRound.query.filter_by(id=round_id, chat_id=user.chat_id).first()
     if not r:
         return jsonify({"ok": False, "error": "Round not found"}), 404
     if r.status != "active":
         return jsonify({"ok": True, "status": r.status, "current_multiplier": str(r.cashout_multiplier or r.crash_multiplier)})
-
     mult, crashed = _aviator_state(r)
     if crashed:
         r.status = "crashed"
@@ -302,8 +311,9 @@ def api_aviator_state():
 @app.post("/api/aviator/cashout")
 def api_aviator_cashout():
     user = get_or_create_user_from_query()
-    round_id = request.json.get("round_id")
-    r = AviatorRound.query.filter_by(id=round_id, user_id=user.id).first()
+    body = request.get_json(silent=True) or {}
+    round_id = body.get("round_id")
+    r = AviatorRound.query.filter_by(id=round_id, chat_id=user.chat_id).first()
     if not r:
         return jsonify({"ok": False, "error": "Round not found"}), 404
     if r.status != "active":
@@ -326,7 +336,7 @@ def api_aviator_cashout():
     r.cashout_time = datetime.now(timezone.utc)
     r.profit_usd = profit
 
-    db.session.add(Tx(user_id=user.id, type="aviator_cashout", status="approved", amount_usd=payout, meta={"mult": str(mult)}))
+    db.session.add(Tx(chat_id=user.chat_id, type="aviator_cashout", status="approved", amount_usd=payout, meta={"mult": str(mult)}))
     db.session.commit()
     return jsonify({"ok": True, "payout_usd": str(payout), "multiplier": str(mult), "balance_usd": str(user.balance_usd), "balance_ngn": str(user.balance_ngn)})
 
@@ -337,13 +347,15 @@ def api_aviator_cashout():
 @app.post("/api/deposit")
 def api_deposit_create():
     user = get_or_create_user_from_query()
-    amount = Decimal(str(request.json.get("amount", "0")))
-    method = (request.json.get("method") or "manual").strip()
-    reference = (request.json.get("reference") or "").strip()
+    body = request.get_json(silent=True) or {}
+    amount = Decimal(str(body.get("amount", "0")))
+    method = (body.get("method") or "manual").strip()
+    reference = (body.get("reference") or "").strip()
+
     if amount < MIN_DEPOSIT:
         return jsonify({"ok": False, "error": f"Minimum deposit is ${MIN_DEPOSIT}"}), 400
 
-    tx = Tx(user_id=user.id, type="deposit", status="pending", amount_usd=to_cents(amount), meta={"method": method, "reference": reference})
+    tx = Tx(chat_id=user.chat_id, type="deposit", status="pending", amount_usd=to_cents(amount), meta={"method": method, "reference": reference})
     db.session.add(tx)
     db.session.commit()
     return jsonify({"ok": True, "message": "Deposit created. Awaiting admin approval.", "tx_id": tx.id})
@@ -352,8 +364,10 @@ def api_deposit_create():
 @app.post("/api/withdraw")
 def api_withdraw_request():
     user = get_or_create_user_from_query()
-    amount = Decimal(str(request.json.get("amount", "0")))
-    payout = (request.json.get("payout") or "").strip()  # bank/wallet info
+    body = request.get_json(silent=True) or {}
+    amount = Decimal(str(body.get("amount", "0")))
+    payout = (body.get("payout") or "").strip()  # bank/wallet info
+
     if amount < MIN_WITHDRAW:
         return jsonify({"ok": False, "error": f"Minimum withdraw is ${MIN_WITHDRAW}"}), 400
     if Decimal(user.balance_usd) < amount:
@@ -363,7 +377,7 @@ def api_withdraw_request():
     user.balance_usd = to_cents(Decimal(user.balance_usd) - amount)
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
 
-    tx = Tx(user_id=user.id, type="withdraw", status="pending", amount_usd=-to_cents(amount), meta={"payout": payout})
+    tx = Tx(chat_id=user.chat_id, type="withdraw", status="pending", amount_usd=-to_cents(amount), meta={"payout": payout})
     db.session.add(tx)
     db.session.commit()
     return jsonify({"ok": True, "message": "Withdrawal requested. Awaiting admin approval.", "tx_id": tx.id, "balance_usd": str(user.balance_usd)})
@@ -372,7 +386,7 @@ def api_withdraw_request():
 @app.get("/api/transactions")
 def api_transactions():
     user = get_or_create_user_from_query()
-    q = Tx.query.filter_by(user_id=user.id).order_by(Tx.id.desc()).limit(50).all()
+    q = Tx.query.filter_by(chat_id=user.chat_id).order_by(Tx.id.desc()).limit(50).all()
     return jsonify({
         "ok": True,
         "items": [
@@ -536,7 +550,7 @@ BASE_HTML = """
       </div>
     </section>
 
-    <footer class=\"text-center text-xs text-slate-500\">Tapify WebApp • v1.1</footer>
+    <footer class=\"text-center text-xs text-slate-500\">Tapify WebApp • v1.2</footer>
   </div>
 
 <script>
@@ -638,14 +652,13 @@ addManual.onclick = ()=>{ const val=parseInt(manualSteps.value||'0'); if (val>0)
 sendSteps.onclick = async ()=>{ if (sessionSteps<=0){ alert('No steps to send'); return; } const r=await fetch(`/api/steps?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ steps: sessionSteps }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Error'); return; } sessionSteps=0; sessionEl.textContent='0'; fetchUser(); };
 
 // Upgrades modal
-const upgradeBtn=document.getElementById('upgrade_btn'); const upgradeModal=document.createElement('dialog');
+const upgradeBtn=document.getElementById('upgrade_btn');
 upgradeBtn?.addEventListener('click', ()=>document.getElementById('upgrade_modal').showModal());
 document.getElementById('close_upgrade').onclick = ()=>document.getElementById('upgrade_modal').close();
 document.getElementById('confirm_upgrade').onclick = async ()=>{ const target=parseInt(document.getElementById('target_level').value||'0'); if(!target||target<2){ alert('Enter target level 2-4'); return; } const r=await fetch(`/api/upgrade?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ target_level: target }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Upgrade failed'); return; } document.getElementById('upgrade_modal').close(); fetchUser(); };
 
 // Wallet
-async function loadHistory(){ const r=await fetch(`/api/transactions?chat_id=${encodeURIComponent(CHAT_ID)}`); const j=await r.json(); const box=document.getElementById('history'); box.innerHTML=''; if(!j.ok) return; for (const t of j.items){ const row=document.createElement('div'); row.className='flex items-center justify-between bg-white/5 rounded px-3 py-2'; const amt=(parseFloat(t.amount_usd)>=0?'+$':'-$')+Math.abs(parseFloat(t.amount_usd)).toFixed(2); row.innerHTML=`<div><div class=\"font-semibold\">${t.type} <span class=\"text-xs text-slate-400\">#${t.id}</span></div><div class=\"text-xs text-slate-400\">${new Date(t.created_at).toLocaleString()}</div></div><div class=\"text-right\"><div class=\"${parseFloat(t.amount_usd)>=0?'text-emerald-300':'text-rose-300'}\">${amt}</div><div class=\"text-xs text-slate-400\">${t.status}</div></div>`; box.appendChild(row); }
-}
+async function loadHistory(){ const r=await fetch(`/api/transactions?chat_id=${encodeURIComponent(CHAT_ID)}`); const j=await r.json(); const box=document.getElementById('history'); box.innerHTML=''; if(!j.ok) return; for (const t of j.items){ const row=document.createElement('div'); row.className='flex items-center justify-between bg-white/5 rounded px-3 py-2'; const amt=(parseFloat(t.amount_usd)>=0?'+$':'-$')+Math.abs(parseFloat(t.amount_usd)).toFixed(2); row.innerHTML=`<div><div class=\"font-semibold\">${t.type} <span class=\"text-xs text-slate-400\">#${t.id}</span></div><div class=\"text-xs text-slate-400\">${new Date(t.created_at).toLocaleString()}</div></div><div class=\"text-right\"><div class=\"${parseFloat(t.amount_usd)>=0?'text-emerald-300':'text-rose-300'}\">${amt}</div><div class=\"text-xs text-slate-400\">${t.status}</div></div>`; box.appendChild(row); } }
 
 document.getElementById('dep_btn').onclick = async ()=>{ const amount=parseFloat(document.getElementById('dep_amount').value||'0').toFixed(2); const reference=document.getElementById('dep_ref').value||''; const r=await fetch(`/api/deposit?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ amount, method:'manual', reference }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Error'); return; } alert(`Deposit submitted. Ticket #${j.tx_id}`); loadHistory(); };
 
@@ -665,7 +678,7 @@ def index():
     _ = get_or_create_user_from_query()
     return render_template_string(
         BASE_HTML,
-        tap_reward=f"${TAP_REWARD}",
+        tap_reward=f"{TAP_REWARD}",
         max_tap=MAX_TAP_PER_REQUEST,
     )
 
@@ -678,131 +691,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-
-
-# ------------------------------------------------------------
-# admin_approvals.py — Telegram bot for approving deposits/withdrawals
-# ------------------------------------------------------------
-# Minimal standalone bot you can run as a separate Render Worker service.
-# Commands (admin-only):
-#   /approve_deposit <tx_id>
-#   /reject_deposit <tx_id>
-#   /approve_withdraw <tx_id>
-#   /reject_withdraw <tx_id>
-# Env:
-#   BOT_TOKEN=...            (Telegram bot token)
-#   ADMIN_IDS=12345,67890    (comma-separated Telegram user IDs allowed to approve)
-#   DATABASE_URL=...         (same DB as app)
-
-if False:
-    # This block is never executed by app.py. Copy to a separate file named admin_approvals.py
-    import os
-    from decimal import Decimal
-    from telegram import Update
-    from telegram.ext import Application, CommandHandler, ContextTypes
-    from sqlalchemy import create_engine, text
-
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    ADMIN_IDS = set([s.strip() for s in (os.getenv("ADMIN_IDS","")) .split(',') if s.strip()])
-    DATABASE_URL = os.getenv("DATABASE_URL")
-
-    engine = create_engine(DATABASE_URL)
-
-    async def _is_admin(update: Update) -> bool:
-        uid = str(update.effective_user.id)
-        if uid in ADMIN_IDS:
-            return True
-        await update.message.reply_text("Not authorized.")
-        return False
-
-    async def approve_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await _is_admin(update): return
-        if not context.args: return await update.message.reply_text("Usage: /approve_deposit <tx_id>")
-        tx_id = context.args[0]
-        with engine.begin() as conn:
-            tx = conn.execute(text("SELECT id, user_id, amount_usd, status FROM transactions WHERE id=:id AND type='deposit'"), {"id": tx_id}).mappings().first()
-            if not tx: return await update.message.reply_text("Deposit not found")
-            if tx["status"] != "pending": return await update.message.reply_text(f"Deposit #{tx_id} is {tx['status']}")
-            # Credit user balance
-            conn.execute(text("UPDATE users SET balance_usd = ROUND(CAST(balance_usd AS NUMERIC) + :amt, 2), balance_ngn = ROUND((CAST(balance_usd AS NUMERIC) + :amt) * 1000, 2) WHERE id=:uid"), {"amt": Decimal(tx["amount_usd"]), "uid": tx["user_id"]})
-            conn.execute(text("UPDATE transactions SET status='approved' WHERE id=:id"), {"id": tx_id})
-        await update.message.reply_text(f"✅ Approved deposit #{tx_id}")
-
-    async def reject_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await _is_admin(update): return
-        if not context.args: return await update.message.reply_text("Usage: /reject_deposit <tx_id>")
-        tx_id = context.args[0]
-        with engine.begin() as conn:
-            r = conn.execute(text("UPDATE transactions SET status='rejected' WHERE id=:id AND type='deposit' AND status='pending'"), {"id": tx_id})
-            if r.rowcount == 0:
-                return await update.message.reply_text("Nothing to reject / invalid state")
-        await update.message.reply_text(f"🚫 Rejected deposit #{tx_id}")
-
-    async def approve_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await _is_admin(update): return
-        if not context.args: return await update.message.reply_text("Usage: /approve_withdraw <tx_id>")
-        tx_id = context.args[0]
-        with engine.begin() as conn:
-            tx = conn.execute(text("SELECT id, user_id, amount_usd, status FROM transactions WHERE id=:id AND type='withdraw'"), {"id": tx_id}).mappings().first()
-            if not tx: return await update.message.reply_text("Withdraw not found")
-            if tx["status"] != "pending": return await update.message.reply_text(f"Withdraw #{tx_id} is {tx['status']}")
-            # Funds already held (amount_usd negative). Just mark approved.
-            conn.execute(text("UPDATE transactions SET status='approved' WHERE id=:id"), {"id": tx_id})
-        await update.message.reply_text(f"✅ Approved withdraw #{tx_id}")
-
-    async def reject_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await _is_admin(update): return
-        if not context.args: return await update.message.reply_text("Usage: /reject_withdraw <tx_id>")
-        tx_id = context.args[0]
-        with engine.begin() as conn:
-            tx = conn.execute(text("SELECT id, user_id, amount_usd, status FROM transactions WHERE id=:id AND type='withdraw'"), {"id": tx_id}).mappings().first()
-            if not tx: return await update.message.reply_text("Withdraw not found")
-            if tx["status"] != "pending": return await update.message.reply_text(f"Withdraw #{tx_id} is {tx['status']}")
-            # Refund the hold: amount_usd is negative; add back to balance
-            conn.execute(text("UPDATE users SET balance_usd = ROUND(CAST(balance_usd AS NUMERIC) - :amt, 2), balance_ngn = ROUND((CAST(balance_usd AS NUMERIC) - :amt) * 1000, 2) WHERE id=:uid"), {"amt": Decimal(tx["amount_usd"]), "uid": tx["user_id"]})
-            conn.execute(text("UPDATE transactions SET status='rejected' WHERE id=:id"), {"id": tx_id})
-            # Record revert for audit
-            conn.execute(text("INSERT INTO transactions (user_id, type, status, amount_usd, meta, created_at) VALUES (:uid, 'withdraw_revert', 'approved', :amt, '{}'::json, NOW())"), {"uid": tx["user_id"], "amt": -Decimal(tx["amount_usd"])})
-        await update.message.reply_text(f"↩️ Rejected withdraw #{tx_id} (refunded)")
-
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Admin bot ready. Use /approve_deposit, /reject_deposit, /approve_withdraw, /reject_withdraw")
-
-    def main():
-        if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN required")
-        app = Application.builder().token(BOT_TOKEN).build()
-        app.add_handler(CommandHandler('start', start))
-        app.add_handler(CommandHandler('approve_deposit', approve_deposit))
-        app.add_handler(CommandHandler('reject_deposit', reject_deposit))
-        app.add_handler(CommandHandler('approve_withdraw', approve_withdraw))
-        app.add_handler(CommandHandler('reject_withdraw', reject_withdraw))
-        app.run_polling()
-
-    if __name__ == '__main__':
-        main()
-
-# -------------------- End admin_approvals.py template --------------------
-
-# --- Deployment helpers (copy to files) ---
-# requirements.txt
-#   flask
-#   flask_sqlalchemy
-#   psycopg2-binary
-#   gunicorn
-#   python-telegram-bot==20.7   # only if you deploy admin_approvals worker
-#
-# Procfile (for Heroku-style) — Render uses Start Command instead
-#   web: gunicorn app:app
-#   worker: python admin_approvals.py    # create a separate Worker service on Render
-#
-# runtime.txt
-#   python-3.11.9
-#
-# Render (Web Service):
-#   Build Command:   pip install -r requirements.txt
-#   Start Command:   gunicorn app:app
-#
-# Render (Worker for admin bot):
-#   Build Command:   pip install -r requirements.txt
-#   Start Command:   python admin_approvals.py
-#   Env: BOT_TOKEN, ADMIN_IDS, DATABASE_URL
