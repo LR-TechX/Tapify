@@ -158,8 +158,21 @@ with app.app_context():
 # User helper
 # --------------------
 def get_or_create_user_from_query():
-    chat_id = request.args.get("chat_id") or request.headers.get("X-Chat-Id") or (request.json or {}).get("chat_id")
-    username = request.args.get("username") or (request.json or {}).get("username")
+    chat_id = None
+    username = None
+
+    # Prefer JSON if available
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        chat_id = body.get("chat_id")
+        username = body.get("username")
+    
+    # Fall back to query params or headers
+    if not chat_id:
+        chat_id = request.args.get("chat_id") or request.headers.get("X-Chat-Id")
+    if not username:
+        username = request.args.get("username")
+
     if not chat_id:
         abort(400, "Missing chat_id. Launch from Telegram WebApp button or append ?chat_id=...")
 
@@ -167,6 +180,8 @@ def get_or_create_user_from_query():
         chat_id = int(chat_id)
     except Exception:
         abort(400, "chat_id must be numeric")
+
+    # --- rest of the code function stays the same ---
 
     user = User.query.get(chat_id)
     if not user:
