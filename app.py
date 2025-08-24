@@ -137,22 +137,20 @@ with app.app_context():
 # Auto-migrate (adds missing columns that the game expects to the shared users table)
 # --------------------
 with app.app_context():
-    alter_sql = """
-    ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1,
-      ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01,
-      ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
-    """
+    alter_sqls = [
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
+]
+for stmt in alter_sqls:
     try:
-        db.session.execute(text(alter_sql))
+        db.session.execute(text(stmt))
         db.session.commit()
     except Exception as e:
-        # Don't crash the app if migration fails; log to stdout/stderr
-        print("Warning: Could not auto-migrate users table →", e)
-
+        print("Warning: Could not apply migration:", e)
 
 # --------------------
 # User helper
@@ -745,14 +743,14 @@ fetchUser(); showPanel('tap');
 
 @app.get("/")
 def index():
-
-    _ = get_or_create_user_from_query()
-    return render_template_string(
-        BASE_HTML,
-        tap_reward=f"{TAP_REWARD}",
-        max_tap=MAX_TAP_PER_REQUEST,
-        username=user.username or user.chat_id,
-    )
+    user =
+    get_or_create_user_from_query()
+        return render_template_string(
+            BASE_HTML,
+            tap_reward=f"{TAP_REWARD}",
+            max_tap=MAX_TAP_PER_REQUEST,
+            username=user.username or user.chat_id,
+        )
 
 
 @app.get("/health")
