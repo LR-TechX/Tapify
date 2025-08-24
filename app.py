@@ -209,9 +209,40 @@ def api_tap():
 # API — Walk & Earn
 # --------------------
 
-@app.route("/app")
+@app.route("/", methods=["GET", "HEAD"])
+@app.route("/app", methods=["GET", "HEAD"])
 def app_entry():
-    return index()
+    chat_id = request.args.get("chat_id")
+    username = request.args.get("username", "guest")
+
+    if not chat_id:
+        return "Missing chat_id", 400
+
+    user = User.query.get(chat_id)
+    if not user:
+        user = User(chat_id=chat_id, username=username)
+        db.session.add(user)
+        db.session.commit()
+
+    # Return same page for GET and HEAD
+    if request.method == "HEAD":
+        return "", 200  
+
+    return render_template_string("""
+    <html>
+    <head><title>Tapify Game</title></head>
+    <body>
+      <h1>Welcome {{user.username}}!</h1>
+      <p>Balance: ${{user.balance_usd}} / ₦{{user.balance_ngn}}</p>
+      <ul>
+        <li><a href="/tap?chat_id={{user.chat_id}}">Tap Coin</a></li>
+        <li><a href="/aviator?chat_id={{user.chat_id}}">Aviator</a></li>
+        <li><a href="/walk?chat_id={{user.chat_id}}">Walk & Earn</a></li>
+        <li><a href="/wallet?chat_id={{user.chat_id}}">Wallet</a></li>
+      </ul>
+    </body>
+    </html>
+    """, user=user)
 
 @app.post("/api/steps")
 def api_steps():
