@@ -19,7 +19,6 @@ from flask import Flask, request, jsonify, render_template_string, abort
 from flask_sqlalchemy import SQLAlchemy
 
 # In Python shell (or add in app.py once)
-from app import db
 db.drop_all()
 
 # --------------------
