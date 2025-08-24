@@ -1,14 +1,3 @@
-# app.py — Tapify WebApp (Flask, Postgres-only, single-file)
-# ----------------------------------------------------------
-# Features
-# - Tap Coin (Notcoin/Hamster-style)
-# - Aviator game (Sporty UI)
-# - Walk & Earn (motion + manual, upgrades)
-# - Wallet: Deposit (admin approval in bot) + Withdraw (funds held until approval)
-# - Uses chat_id as the user key everywhere (no numeric user.id)
-# - Signup bonus $8 (₦8000) on first visit
-# - Tailwind UI in a single file
-
 import os
 import json
 import random
@@ -17,6 +6,7 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 
 from flask import Flask, request, jsonify, render_template_string, abort
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 
 # --------------------
 # Config
@@ -93,7 +83,8 @@ class User(db.Model):
     walk_rate = db.Column(db.Numeric(18, 4), default=Decimal("0.01"))
     total_steps = db.Column(db.BigInteger, default=0)
 
-    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda:
+    datetime.now(timezone.utc))
 
     def ensure_defaults(self):
         changed = False
@@ -116,9 +107,11 @@ class Tx(db.Model):
     chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"), nullable=False)
     type = db.Column(db.String(64), nullable=False)  # tap, walk, aviator_bet, aviator_cashout, upgrade, deposit, withdraw, withdraw_revert, signup_bonus
     status = db.Column(db.String(32), default="approved")  # approved|pending|rejected
+
     amount_usd = db.Column(db.Numeric(18, 2), nullable=False)
     meta = db.Column(db.JSON)
-    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda:
+    datetime.now(timezone.utc))
 
 
 class AviatorRound(db.Model):
@@ -128,7 +121,8 @@ class AviatorRound(db.Model):
     bet_usd = db.Column(db.Numeric(18, 2), nullable=False)
     start_time = db.Column(db.DateTime(timezone=True), nullable=False)
     crash_multiplier = db.Column(db.Numeric(18, 2), nullable=False)
-    growth_per_sec = db.Column(db.Numeric(18, 2), nullable=False, default=AVIATOR_GROWTH_PER_SEC)
+    growth_per_sec = db.Column(db.Numeric(18, 2), nullable=False,
+                               default=AVIATOR_GROWTH_PER_SEC)
 
     status = db.Column(db.String(32), default="active")  # active|cashed|crashed
     cashout_multiplier = db.Column(db.Numeric(18, 2))
@@ -138,6 +132,26 @@ class AviatorRound(db.Model):
 
 with app.app_context():
     db.create_all()
+
+# --------------------
+# Auto-migrate (adds missing columns that the game expects to the shared users table)
+# --------------------
+with app.app_context():
+    alter_sql = """
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01,
+      ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    """
+    try:
+        db.session.execute(text(alter_sql))
+        db.session.commit()
+    except Exception as e:
+        # Don't crash the app if migration fails; log to stdout/stderr
+        print("Warning: Could not auto-migrate users table →", e)
 
 
 # --------------------
@@ -156,6 +170,7 @@ def get_or_create_user_from_query():
 
     user = User.query.get(chat_id)
     if not user:
+
         user = User(chat_id=chat_id, username=username)
         user.ensure_defaults()
         # Signup bonus
@@ -199,6 +214,7 @@ def api_tap():
     count = max(1, min(count, MAX_TAP_PER_REQUEST))
     earn = to_cents(TAP_REWARD * Decimal(count))
     user.balance_usd = to_cents(Decimal(user.balance_usd) + earn)
+
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
     db.session.add(Tx(chat_id=user.chat_id, type="tap", status="approved", amount_usd=earn, meta={"count": count}))
     db.session.commit()
@@ -226,7 +242,7 @@ def app_entry():
 
     # Return same page for GET and HEAD
     if request.method == "HEAD":
-        return "", 200  
+        return "", 200
 
     return render_template_string("""
     <html>
@@ -241,6 +257,7 @@ def app_entry():
         <li><a href="/wallet?chat_id={{user.chat_id}}">Wallet</a></li>
       </ul>
     </body>
+
     </html>
     """, user=user)
 
@@ -322,6 +339,7 @@ def _aviator_state(round_obj: AviatorRound):
     elapsed = Decimal(str((now - round_obj.start_time).total_seconds()))
     current_mult = Decimal("1.00") + (Decimal(round_obj.growth_per_sec) * elapsed)
     crashed = current_mult >= Decimal(round_obj.crash_multiplier)
+
     if crashed:
         current_mult = Decimal(round_obj.crash_multiplier)
     return current_mult.quantize(Decimal("0.01"), rounding=ROUND_DOWN), crashed
@@ -365,6 +383,7 @@ def api_aviator_cashout():
     profit = to_cents(payout - Decimal(r.bet_usd))
 
     user.balance_usd = to_cents(Decimal(user.balance_usd) + payout)
+
     user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
 
     r.status = "cashed"
@@ -405,6 +424,7 @@ def api_withdraw_request():
     payout = (body.get("payout") or "").strip()  # bank/wallet info
 
     if amount < MIN_WITHDRAW:
+
         return jsonify({"ok": False, "error": f"Minimum withdraw is ${MIN_WITHDRAW}"}), 400
     if Decimal(user.balance_usd) < amount:
         return jsonify({"ok": False, "error": "Insufficient balance"}), 400
@@ -447,9 +467,12 @@ BASE_HTML = """
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+
   <title>Tapify — WebApp</title>
   <script src=\"https://cdn.tailwindcss.com\"></script>
-  <link href=\"https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap\" rel=\"stylesheet\"/>
+  <link
+href=\"https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap\"
+rel=\"stylesheet\"/>
   <style>
     body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial; }
     .glass { backdrop-filter: blur(8px); background: rgba(255,255,255,0.08); }
@@ -486,6 +509,7 @@ BASE_HTML = """
       <div class=\"text-center space-y-2\">
         <div class=\"text-slate-300 text-sm\">Tap the coin to earn ${{tap_reward}} per tap</div>
         <button id=\"tap_btn\" class=\"btn bg-amber-400 text-slate-900 w-full text-xl\">💰 TAP</button>
+
         <div class=\"text-sm text-slate-400\">You can batch up to {{max_tap}} taps per request.</div>
       </div>
     </section>
@@ -524,6 +548,7 @@ BASE_HTML = """
       </div>
 
       <div class=\"space-y-3\">
+
         <div class=\"text-sm text-slate-300\">Use auto step counter (motion) or input manually if your device blocks sensors.</div>
         <div class=\"grid grid-cols-3 gap-3\">
           <button id=\"start_walk\" class=\"btn bg-teal-400 text-slate-900\">Start</button>
@@ -557,6 +582,7 @@ BASE_HTML = """
     </section>
 
     <!-- Wallet Tab -->
+
     <section id=\"panel_wallet\" class=\"glass card p-5 space-y-5 hidden\">
       <h2 class=\"font-bold text-lg\">Wallet</h2>
 
@@ -594,6 +620,7 @@ const qs = new URLSearchParams(location.search);
 const CHAT_ID = qs.get('chat_id');
 const USERNAME = qs.get('username') || '';
 if (!CHAT_ID) alert('Missing chat_id. Please open from the Telegram button.');
+
 
 const panels = {
   tap: document.getElementById('panel_tap'),
@@ -636,12 +663,14 @@ let tapCountBatch = 0;
 const tapBtn = document.getElementById('tap_btn');
 const MAX_TAP = {{max_tap}};
 function flushTaps() {
+
   if (tapCountBatch <= 0) return;
   const count = tapCountBatch; tapCountBatch = 0;
   fetch(`/api/tap?chat_id=${encodeURIComponent(CHAT_ID)}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ count }) })
     .then(()=>fetchUser());
 }
- tapBtn.addEventListener('click', ()=>{ tapCountBatch++; if (tapCountBatch>=MAX_TAP) flushTaps(); tapBtn.classList.add('scale-95'); setTimeout(()=>tapBtn.classList.remove('scale-95'),80);});
+ tapBtn.addEventListener('click', ()=>{ tapCountBatch++; if (tapCountBatch>=MAX_TAP) flushTaps(); tapBtn.classList.add('scale-95');
+setTimeout(()=>tapBtn.classList.remove('scale-95'),80);});
  setInterval(flushTaps, 1200);
 
 // Aviator
@@ -670,6 +699,7 @@ betBtn.onclick = async () => {
 cashoutBtn.onclick = async () => {
   if (!currentRoundId) return;
   const r = await fetch(`/api/aviator/cashout?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ round_id: currentRoundId }) });
+
   const j = await r.json(); if (!j.ok) { alert(j.error||'Cashout failed'); return; }
   statusText.textContent = `✅ Cashed at ${j.multiplier}× — +$${j.payout_usd}`; cashoutBtn.disabled=true;
   if (aviatorTimer) { clearInterval(aviatorTimer); aviatorTimer=null; }
@@ -682,16 +712,20 @@ const startWalk = document.getElementById('start_walk'); const stopWalk = docume
 const sendSteps = document.getElementById('send_steps'); const manualSteps = document.getElementById('manual_steps'); const addManual = document.getElementById('add_manual');
 let motionListener = null; let lastMagnitude = null; let stepThreshold = 1.2;
 startWalk.onclick = async ()=>{ if (typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function') { try{ await DeviceMotionEvent.requestPermission(); }catch(e){} }
-  if (motionListener) return; motionListener=(e)=>{ const ax=e.accelerationIncludingGravity.x||0, ay=e.accelerationIncludingGravity.y||0, az=e.accelerationIncludingGravity.z||0; const mag=Math.sqrt(ax*ax+ay*ay+az*az); if (lastMagnitude===null) lastMagnitude=mag; const d=Math.abs(mag-lastMagnitude); if (d>stepThreshold){ sessionSteps+=1; sessionEl.textContent=sessionSteps; } lastMagnitude=mag; }; window.addEventListener('devicemotion', motionListener); };
+  if (motionListener) return; motionListener=(e)=>{ const ax=e.accelerationIncludingGravity.x||0, ay=e.accelerationIncludingGravity.y||0, az=e.accelerationIncludingGravity.z||0; const mag=Math.sqrt(ax*ax+ay*ay+az*az); if (lastMagnitude===null) lastMagnitude=mag; const d=Math.abs(mag-lastMagnitude); if (d>stepThreshold){ sessionSteps+=1; sessionEl.textContent=sessionSteps; } lastMagnitude=mag; };
+window.addEventListener('devicemotion', motionListener); };
 stopWalk.onclick = ()=>{ if (motionListener){ window.removeEventListener('devicemotion', motionListener); motionListener=null; lastMagnitude=null; } };
 addManual.onclick = ()=>{ const val=parseInt(manualSteps.value||'0'); if (val>0){ sessionSteps+=val; sessionEl.textContent=sessionSteps; manualSteps.value=''; } };
 sendSteps.onclick = async ()=>{ if (sessionSteps<=0){ alert('No steps to send'); return; } const r=await fetch(`/api/steps?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ steps: sessionSteps }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Error'); return; } sessionSteps=0; sessionEl.textContent='0'; fetchUser(); };
 
 // Upgrades modal
 const upgradeBtn=document.getElementById('upgrade_btn');
-upgradeBtn?.addEventListener('click', ()=>document.getElementById('upgrade_modal').showModal());
-document.getElementById('close_upgrade').onclick = ()=>document.getElementById('upgrade_modal').close();
-document.getElementById('confirm_upgrade').onclick = async ()=>{ const target=parseInt(document.getElementById('target_level').value||'0'); if(!target||target<2){ alert('Enter target level 2-4'); return; } const r=await fetch(`/api/upgrade?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ target_level: target }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Upgrade failed'); return; } document.getElementById('upgrade_modal').close(); fetchUser(); };
+upgradeBtn?.addEventListener('click',
+()=>document.getElementById('upgrade_modal').showModal());
+document.getElementById('close_upgrade').onclick =
+()=>document.getElementById('upgrade_modal').close();
+document.getElementById('confirm_upgrade').onclick = async ()=>{ const target=parseInt(document.getElementById('target_level').value||'0'); if(!target||target<2){ alert('Enter target level 2-4'); return; } const r=await fetch(`/api/upgrade?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST',
+headers:{'Content-Type':'application/json'}, body: JSON.stringify({ target_level: target }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Upgrade failed'); return; } document.getElementById('upgrade_modal').close(); fetchUser(); };
 
 // Wallet
 async function loadHistory(){ const r=await fetch(`/api/transactions?chat_id=${encodeURIComponent(CHAT_ID)}`); const j=await r.json(); const box=document.getElementById('history'); box.innerHTML=''; if(!j.ok) return; for (const t of j.items){ const row=document.createElement('div'); row.className='flex items-center justify-between bg-white/5 rounded px-3 py-2'; const amt=(parseFloat(t.amount_usd)>=0?'+$':'-$')+Math.abs(parseFloat(t.amount_usd)).toFixed(2); row.innerHTML=`<div><div class=\"font-semibold\">${t.type} <span class=\"text-xs text-slate-400\">#${t.id}</span></div><div class=\"text-xs text-slate-400\">${new Date(t.created_at).toLocaleString()}</div></div><div class=\"text-right\"><div class=\"${parseFloat(t.amount_usd)>=0?'text-emerald-300':'text-rose-300'}\">${amt}</div><div class=\"text-xs text-slate-400\">${t.status}</div></div>`; box.appendChild(row); } }
@@ -699,6 +733,7 @@ async function loadHistory(){ const r=await fetch(`/api/transactions?chat_id=${e
 document.getElementById('dep_btn').onclick = async ()=>{ const amount=parseFloat(document.getElementById('dep_amount').value||'0').toFixed(2); const reference=document.getElementById('dep_ref').value||''; const r=await fetch(`/api/deposit?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ amount, method:'manual', reference }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Error'); return; } alert(`Deposit submitted. Ticket #${j.tx_id}`); loadHistory(); };
 
 document.getElementById('wd_btn').onclick = async ()=>{ const amount=parseFloat(document.getElementById('wd_amount').value||'0').toFixed(2); const payout=document.getElementById('wd_payout').value||''; const r=await fetch(`/api/withdraw?chat_id=${encodeURIComponent(CHAT_ID)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ amount, payout }) }); const j=await r.json(); if(!j.ok){ alert(j.error||'Error'); return; } alert(`Withdrawal requested. Ticket #${j.tx_id}`); fetchUser(); loadHistory(); };
+
 
 // Init
 fetchUser(); showPanel('tap');
@@ -708,9 +743,9 @@ fetchUser(); showPanel('tap');
 </html>
 """
 
-
 @app.get("/")
 def index():
+
     _ = get_or_create_user_from_query()
     return render_template_string(
         BASE_HTML,
