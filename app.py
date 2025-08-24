@@ -743,14 +743,13 @@ fetchUser(); showPanel('tap');
 
 @app.get("/")
 def index():
-    user =
-    get_or_create_user_from_query()
-        return render_template_string(
-            BASE_HTML,
-            tap_reward=f"{TAP_REWARD}",
-            max_tap=MAX_TAP_PER_REQUEST,
-            username=user.username or user.chat_id,
-        )
+    user = get_or_create_user_from_query()
+    return render_template_string(
+        BASE_HTML,
+        tap_reward=f"{TAP_REWARD}",
+        max_tap=MAX_TAP_PER_REQUEST,
+        username=user.username or user.chat_id,
+    )
 
 
 @app.get("/health")
