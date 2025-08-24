@@ -244,7 +244,7 @@ def app_entry():
     if request.method == "HEAD":
         return "", 200
 
-    return render_template_string()
+    return index()
 
 @app.post("/api/steps")
 def api_steps():
