@@ -793,9 +793,9 @@ def index():
     )
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+#@app.get("/health")
+#def health():
+#    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
 
 if __name__ == "__main__":
