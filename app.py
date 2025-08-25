@@ -136,21 +136,60 @@ with app.app_context():
 # --------------------
 # Auto-migrate (adds missing columns that the game expects to the shared users table)
 # --------------------
-with app.app_context():
-    alter_sqls = [
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
-]
-for stmt in alter_sqls:
-    try:
-        db.session.execute(text(stmt))
+def run_migrations():
+    with app.app_context():
+        # create / alter users
+        db.session.execute(text("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id BIGINT PRIMARY KEY,
+            username TEXT
+        )
+        """))
         db.session.commit()
-    except Exception as e:
-        print("Warning: Could not apply migration:", e)
+
+        user_alters = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
+        ]
+        for stmt in user_alters:
+            try:
+                db.session.execute(text(stmt))
+                db.session.commit()
+            except Exception as e:
+                print("Migration warning (users):", e)
+
+        # create / alter aviator_rounds
+        db.session.execute(text("""
+        CREATE TABLE IF NOT EXISTS aviator_rounds (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT REFERENCES users(chat_id),
+            start_time TIMESTAMPTZ DEFAULT NOW()
+        )
+        """))
+        db.session.commit()
+
+        aviator_alters = [
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS bet_usd NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS crash_multiplier NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS growth_per_sec NUMERIC(18,4)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS status TEXT",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS cashout_multiplier NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS cashout_time TIMESTAMPTZ",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS profit_usd NUMERIC(18,2)"
+        ]
+        for stmt in aviator_alters:
+            try:
+                db.session.execute(text(stmt))
+                db.session.commit()
+            except Exception as e:
+                print("Migration warning (aviator_rounds):", e)
+
+# Run once at startup
+run_migrations()
 
 # --------------------
 # User helper
