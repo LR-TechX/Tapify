@@ -189,18 +189,18 @@ def run_migrations():
                 print("Migration warning (aviator_rounds):", e)
 
 # create / alter transactions
-     db.session.execute(text("""
-     CREATE TABLE IF NOT EXISTS transactions (
-         id SERIAL PRIMARY KEY,
-         chat_id BIGINT REFERENCES users(chat_id),
-         type TEXT NOT NULL,
-         status TEXT DEFAULT 'approved',
-         amount_usd NUMERIC(18,2) NOT NULL,
-         meta JSON,
-         created_at TIMESTAMPTZ DEFAULT NOW()
-     )
-     """))
-     db.session.commit()
+        db.session.execute(text("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT REFERENCES users(chat_id),
+            type TEXT NOT NULL,
+            status TEXT DEFAULT 'approved',
+            amount_usd NUMERIC(18,2) NOT NULL,
+            meta JSON,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """))
+        db.session.commit()
 
 # Run once at startup
 run_migrations()
@@ -299,7 +299,7 @@ def api_tap():
 # --------------------
 
 @app.route("/", methods=["GET", "HEAD"])
-def game_index():
+def index():
     # Health check and “no chat_id” landing
     if request.method == "HEAD" or not request.args.get("chat_id"):
         # Return 200 so Render health checks pass
@@ -795,6 +795,7 @@ fetchUser(); showPanel('tap');
 </body>
 </html>
 """
+
 
 #@app.get("/health")
 #def health():
