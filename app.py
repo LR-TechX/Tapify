@@ -178,83 +178,81 @@ with app.app_context():
 # Auto-migrations (idempotent)
 # =========================
 def run_migrations():
+    def safe_exec(statement, label=""):
+        try:
+            db.session.execute(text(statement))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"Migration warning ({label}):", e)
+
     with app.app_context():
-        # users
-        db.session.execute(text("""
+        # --- USERS TABLE ---
+        safe_exec("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id BIGINT PRIMARY KEY,
             username TEXT
         )
-        """))
-        db.session.commit()
+        """, "users base")
 
         user_alters = [
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.001",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS steps_credited_on DATE",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS steps_usd_today NUMERIC(18,2) DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
         ]
         for stmt in user_alters:
-            try:
-                db.session.execute(text(stmt)); db.session.commit()
-            except Exception as e:
-                print("Migration warning (users):", e)
+            safe_exec(stmt, "users alter")
 
-        # aviator_rounds
-        db.session.execute(text("""
+        # --- AVIATOR_ROUNDS TABLE ---
+        safe_exec("""
         CREATE TABLE IF NOT EXISTS aviator_rounds (
             id SERIAL PRIMARY KEY,
             chat_id BIGINT REFERENCES users(chat_id),
             start_time TIMESTAMPTZ DEFAULT NOW()
         )
-        """))
-        db.session.commit()
+        """, "aviator_rounds base")
+
         aviator_alters = [
             "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS bet_usd NUMERIC(18,2)",
             "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS crash_multiplier NUMERIC(18,2)",
-            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS growth_per_sec NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS growth_per_sec NUMERIC(18,4)",
             "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS status TEXT",
             "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS cashout_multiplier NUMERIC(18,2)",
             "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS cashout_time TIMESTAMPTZ",
             "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS profit_usd NUMERIC(18,2)"
         ]
         for stmt in aviator_alters:
-            try:
-                db.session.execute(text(stmt)); db.session.commit()
-            except Exception as e:
-                print("Migration warning (aviator_rounds):", e)
+            safe_exec(stmt, "aviator_rounds alter")
 
-        # transactions
-        db.session.execute(text("""
+        # --- TRANSACTIONS TABLE ---
+        safe_exec("""
         CREATE TABLE IF NOT EXISTS transactions (
             id SERIAL PRIMARY KEY,
             chat_id BIGINT REFERENCES users(chat_id),
-            type TEXT NOT NULL,
-            status TEXT DEFAULT 'approved',
-            amount_usd NUMERIC(18,2) NOT NULL,
+            amount_usd NUMERIC(18,2),
             amount_ngn NUMERIC(18,2),
-            external_ref TEXT UNIQUE,
-            meta JSON,
+            type TEXT,
+            status TEXT,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
-        """))
-        db.session.commit()
-        # Ensure unique index on external_ref when not null (older Postgres versions)
-        try:
-            db.session.execute(text("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_ref
-                ON transactions (external_ref) WHERE external_ref IS NOT NULL
-            """))
-            db.session.commit()
-        except Exception as e:
-            print("Migration warning (transactions ext_ref idx):", e)
+        """, "transactions base")
 
-        # withdrawals
-        db.session.execute(text("""
+        # Ensure external_ref exists
+        safe_exec("""
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS external_ref TEXT
+        """, "transactions external_ref")
+
+        # Then create index
+        safe_exec("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_ref
+        ON transactions (external_ref) WHERE external_ref IS NOT NULL
+        """, "transactions ext_ref idx")
+
+        # --- WITHDRAWAL_REQUESTS TABLE ---
+        safe_exec("""
         CREATE TABLE IF NOT EXISTS withdrawal_requests (
             id SERIAL PRIMARY KEY,
             chat_id BIGINT REFERENCES users(chat_id),
@@ -263,9 +261,8 @@ def run_migrations():
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
-        """))
-        db.session.commit()
-
+        """, "withdrawal_requests base")
+        
 run_migrations()
 
 # =========================
