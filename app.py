@@ -285,25 +285,20 @@ def api_tap():
 # --------------------
 
 @app.route("/", methods=["GET", "HEAD"])
-@app.route("/app", methods=["GET", "HEAD"])
-def app_entry():
-    chat_id = request.args.get("chat_id")
-    username = request.args.get("username", "guest")
+def index():
+    # Health check and “no chat_id” landing
+    if request.method == "HEAD" or not request.args.get("chat_id"):
+        # Return 200 so Render health checks pass
+        return "OK", 200
 
-    if not chat_id:
-        return "Missing chat_id", 400
-
-    user = User.query.get(chat_id)
-    if not user:
-        user = User(chat_id=chat_id, username=username)
-        db.session.add(user)
-        db.session.commit()
-
-    # Return same page for GET and HEAD
-    if request.method == "HEAD":
-        return "", 200
-
-    return index()
+    # Only create/fetch the user if chat_id is actually provided
+    user = get_or_create_user_from_query()
+    return render_template_string(
+        BASE_HTML,
+        tap_reward=f"{TAP_REWARD}",
+        max_tap=MAX_TAP_PER_REQUEST,
+        username=user.username or user.chat_id,
+    )
 
 @app.post("/api/steps")
 def api_steps():
@@ -805,4 +800,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    #app.run(host="0.0.0.0", port=port)
