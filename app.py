@@ -53,6 +53,13 @@ def sample_crash_multiplier() -> Decimal:
     else:
         return Decimal(str(round(random.uniform(10.0, 50.0), 2)))
 
+def sync_user_balance(user):
+    # Example: ensure balances never go below 0
+    if user.balance_usd < 0:
+        user.balance_usd = Decimal("0.00")
+    if user.balance_ngn < 0:
+        user.balance_ngn = Decimal("0.00")
+    db.session.commit()
 
 # --------------------
 # App & DB
