@@ -1,10 +1,12 @@
-# app.py
+#Web edit version....
+
 import os
 import json
 import hmac
 import hashlib
 import random
-from datetime import datetime, date, timezone, timedelta
+import requests
+from datetime import datetime, date, timezone
 from decimal import Decimal, ROUND_DOWN, getcontext
 
 from flask import Flask, request, jsonify, render_template_string, abort
@@ -16,184 +18,286 @@ from sqlalchemy import text
 # =========================
 getcontext().prec = 28
 
-# Required env vars (as per original)
-DATABASE_URL         = os.environ.get("DATABASE_URL", "sqlite:///tapify.sqlite3")
+# Required env vars (set these on Render/hosting)
+DATABASE_URL         = os.environ["DATABASE_URL"]
 SECRET_KEY           = os.environ.get("SECRET_KEY", "dev-secret")
-PAYSTACK_SECRET_KEY  = os.environ.get("PAYSTACK_SECRET_KEY")  # optional in this build
-ADMIN_TOKEN          = os.environ.get("ADMIN_TOKEN", "change-me")
+PAYSTACK_SECRET_KEY  = os.environ.get("PAYSTACK_SECRET_KEY")   # live/test secret key
+ADMIN_TOKEN          = os.environ.get("ADMIN_TOKEN", "change-me")  # for admin endpoints
 
 # Money model: $1 == ₦1000 (project convention)
 USD_TO_NGN = Decimal("1000")
 
-# Tap config
-TAP_REWARD = Decimal("0.001")  # $ per tap (example from prior conventions)
-MAX_TAP_PER_FLUSH = 200        # server-side safety
+# Tap
+TAP_REWARD = Decimal("0.001")     # $ per tap
+MAX_TAP_PER_REQUEST = 50
 
-# Aviator config
-AVIATOR_GROWTH_PER_SEC = Decimal("0.05")  # 5%/sec linear growth
-MIN_BET = Decimal("0.10")
-MAX_BET = Decimal("100.00")
-
-# Walk config
-BASE_DAILY_WALK_CAP_USD = Decimal("1.00")   # at level-1 (0.001 $/step)
+# Walk upgrades (level -> {rate per step in USD, price in USD})
+# Base: 1000 steps = $1 ⇒ rate = $0.001/step
 WALK_UPGRADES = {
     1: {"rate": Decimal("0.001"), "price": Decimal("0.00")},
-    2: {"rate": Decimal("0.002"), "price": Decimal("2.00")},
-    3: {"rate": Decimal("0.003"), "price": Decimal("5.00")},
-    4: {"rate": Decimal("0.005"), "price": Decimal("12.00")},
+    2: {"rate": Decimal("0.002"), "price": Decimal("5.00")},
+    3: {"rate": Decimal("0.005"), "price": Decimal("15.00")},
+    4: {"rate": Decimal("0.010"), "price": Decimal("40.00")},
 }
 
-# =========================
-# App / DB
-# =========================
-app = Flask(__name__)
-app.config["SECRET_KEY"] = SECRET_KEY
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# Aviator
+AVIATOR_GROWTH_PER_SEC = Decimal("0.25")
+MIN_BET = Decimal("1000.00")       # USD
+MAX_BET = Decimal("1000000.00")    # USD
 
-db = SQLAlchemy(app)
-
+# Wallet
+MIN_DEPOSIT_NGN = Decimal("100.00")   # ₦ minimum deposit
+MIN_WITHDRAW_USD = Decimal("50.00")   # $ minimum withdrawal
 
 # =========================
-# Helpers
+# Utils
 # =========================
 def now_utc():
     return datetime.now(timezone.utc)
 
-def to_cents(x: Decimal | str | float) -> Decimal:
-    if not isinstance(x, Decimal):
-        x = Decimal(str(x))
-    return x.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
-def sign_payload(secret: str, body_bytes: bytes) -> str:
-    return hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha512).hexdigest()
-
-def clamp_nonnegative_amount(d: Decimal) -> Decimal:
-    return to_cents(max(Decimal("0.00"), d))
-
-def current_walk_cap_usd(user: "User") -> Decimal:
-    rate = Decimal(user.walk_rate or "0.001")
-    scale = rate / Decimal("0.001")
-    cap = BASE_DAILY_WALK_CAP_USD * scale
-    return to_cents(cap)
-
-def ensure_today_walk_counter(user: "User"):
-    today = date.today()
-    if user.steps_credited_on != today:
-        user.steps_credited_on = today
-        user.steps_usd_today = Decimal("0.00")
-        db.session.commit()
+def to_cents(x: Decimal) -> Decimal:
+    return Decimal(x).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 def sample_crash_multiplier() -> Decimal:
-    # Simple distribution: 30% crash <1.5, 50% between 1.5–3, 20% 3–10
+    """Heavy-tailed crash multiplier."""
     r = random.random()
-    if r < 0.30:
-        return to_cents(Decimal("1.10") + Decimal(str(random.random())) * Decimal("0.30"))
     if r < 0.80:
-        return to_cents(Decimal("1.50") + Decimal(str(random.random())) * Decimal("1.50"))
-    return to_cents(Decimal("3.00") + Decimal(str(random.random())) * Decimal("7.00"))
+        return Decimal(str(round(random.uniform(1.10, 3.0), 2)))
+    elif r < 0.98:
+        return Decimal(str(round(random.uniform(3.0, 10.0), 2)))
+    else:
+        return Decimal(str(round(random.uniform(10.0, 50.0), 2)))
 
+def paystack_signature_valid(raw_body: bytes, signature: str) -> bool:
+    if not PAYSTACK_SECRET_KEY or not signature:
+        return False
+    digest = hmac.new(
+        PAYSTACK_SECRET_KEY.encode("utf-8"),
+        raw_body,
+        hashlib.sha512
+    ).hexdigest()
+    return hmac.compare_digest(digest, signature)
+
+def require_admin():
+    token = request.headers.get("X-Admin-Token") or request.args.get("admin_token")
+    if not token or token != ADMIN_TOKEN:
+        abort(403, "Admin token required")
+
+# =========================
+# App & DB
+# =========================
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SQLALCHEMY_DATABASE_URI=DATABASE_URL,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+)
+
+db = SQLAlchemy(app)
 
 # =========================
 # Models
 # =========================
 class User(db.Model):
     __tablename__ = "users"
-    chat_id = db.Column(db.BigInteger, primary_key=True)
-    username = db.Column(db.String(64), nullable=True)
+    chat_id = db.Column(db.BigInteger, primary_key=True)   # Telegram chat_id
+    username = db.Column(db.String(128))
 
-    balance_usd = db.Column(db.Numeric(10, 2), default=Decimal("0.00"))
-    balance_ngn = db.Column(db.Numeric(12, 2), default=Decimal("0.00"))
+    balance_usd = db.Column(db.Numeric(18, 2), default=Decimal("0.00"))
+    balance_ngn = db.Column(db.Numeric(18, 2), default=Decimal("0.00"))
 
-    # Tap / walk
-    taps = db.Column(db.Integer, default=0)
     walk_level = db.Column(db.Integer, default=1)
-    walk_rate = db.Column(db.Numeric(8, 3), default=Decimal("0.001"))
-    steps_credited_on = db.Column(db.Date, nullable=True)
-    steps_usd_today = db.Column(db.Numeric(10, 2), default=Decimal("0.00"))
+    walk_rate = db.Column(db.Numeric(18, 4), default=Decimal("0.001"))  # $/step
+    total_steps = db.Column(db.BigInteger, default=0)
+
+    # Daily cap tracking for Walk
+    steps_credited_on = db.Column(db.Date)
+    steps_usd_today   = db.Column(db.Numeric(18, 2), default=Decimal("0.00"))
 
     created_at = db.Column(db.DateTime(timezone=True), default=now_utc)
 
-    def ensure_defaults(self) -> bool:
+    def ensure_defaults(self):
         changed = False
-        if self.walk_level is None:
-            self.walk_level = 1
-            changed = True
-        if self.walk_rate is None:
-            self.walk_rate = Decimal("0.001")
-            changed = True
         if self.balance_usd is None:
-            self.balance_usd = Decimal("0.00")
-            changed = True
+            self.balance_usd = Decimal("0.00"); changed = True
         if self.balance_ngn is None:
-            self.balance_ngn = Decimal("0.00")
-            changed = True
+            self.balance_ngn = Decimal("0.00"); changed = True
+        if not self.walk_level:
+            self.walk_level = 1; changed = True
+        if not self.walk_rate:
+            self.walk_rate = Decimal("0.001"); changed = True
+        if self.total_steps is None:
+            self.total_steps = 0; changed = True
+        if self.steps_credited_on is None:
+            self.steps_credited_on = date.today(); changed = True
+        if self.steps_usd_today is None:
+            self.steps_usd_today = Decimal("0.00"); changed = True
         return changed
 
 
 class Transaction(db.Model):
     __tablename__ = "transactions"
     id = db.Column(db.Integer, primary_key=True)
-    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"))
-    type = db.Column(db.String(32))   # deposit, withdraw, tap_earn, aviator_bet, aviator_win, etc.
-    status = db.Column(db.String(32), default="approved")
-    amount_usd = db.Column(db.Numeric(10, 2), default=Decimal("0.00"))
-    amount_ngn = db.Column(db.Numeric(12, 2), nullable=True)
-    external_ref = db.Column(db.String(128), nullable=True)
-    meta_json = db.Column(db.Text, default="{}")
+    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"), nullable=False)
+    type = db.Column(db.String(64), nullable=False)  # tap, walk, aviator_bet, aviator_cashout, upgrade, deposit, withdraw, withdraw_revert
+    status = db.Column(db.String(32), default="approved")  # pending|approved|completed|rejected
+    amount_usd = db.Column(db.Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    amount_ngn = db.Column(db.Numeric(18, 2))
+    external_ref = db.Column(db.String(128), unique=True)  # Paystack reference/id
+    meta = db.Column(db.JSON)
     created_at = db.Column(db.DateTime(timezone=True), default=now_utc)
 
-    @property
-    def meta(self):
-        try:
-            return json.loads(self.meta_json or "{}")
-        except Exception:
-            return {}
 
-    @meta.setter
-    def meta(self, val: dict):
-        self.meta_json = json.dumps(val or {})
+class WithdrawalRequest(db.Model):
+    __tablename__ = "withdrawal_requests"
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"), nullable=False)
+    amount_usd = db.Column(db.Numeric(18, 2), nullable=False)
+    amount_ngn = db.Column(db.Numeric(18, 2), nullable=False)
+    status = db.Column(db.String(20), default="pending")  # pending|approved|rejected
+    created_at = db.Column(db.DateTime(timezone=True), default=now_utc)
 
 
 class AviatorRound(db.Model):
     __tablename__ = "aviator_rounds"
     id = db.Column(db.Integer, primary_key=True)
-    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"))
-    bet_usd = db.Column(db.Numeric(10, 2))
-    start_time = db.Column(db.DateTime(timezone=True))
-    crash_multiplier = db.Column(db.Numeric(6, 2))
-    growth_per_sec = db.Column(db.Numeric(6, 3), default=AVIATOR_GROWTH_PER_SEC)
-    status = db.Column(db.String(16), default="active")  # active, cashed, crashed
-    cashout_multiplier = db.Column(db.Numeric(6, 2), nullable=True)
-    created_at = db.Column(db.DateTime(timezone=True), default=now_utc)
+    chat_id = db.Column(db.BigInteger, db.ForeignKey("users.chat_id"), nullable=False)
+    bet_usd = db.Column(db.Numeric(18, 2), nullable=False)
+    start_time = db.Column(db.DateTime(timezone=True), nullable=False)
+    crash_multiplier = db.Column(db.Numeric(18, 2), nullable=False)
+    growth_per_sec = db.Column(db.Numeric(18, 2), nullable=False, default=AVIATOR_GROWTH_PER_SEC)
+
+    status = db.Column(db.String(32), default="active")  # active|cashed|crashed
+    cashout_multiplier = db.Column(db.Numeric(18, 2))
+    cashout_time = db.Column(db.DateTime(timezone=True))
+    profit_usd = db.Column(db.Numeric(18, 2))
 
 
 with app.app_context():
     db.create_all()
 
+# =========================
+# Auto-migrations (idempotent)
+# =========================
+def run_migrations():
+    def safe_exec(statement, label=""):
+        try:
+            db.session.execute(text(statement))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"Migration warning ({label}):", e)
+
+    with app.app_context():
+        # --- USERS TABLE ---
+        safe_exec("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id BIGINT PRIMARY KEY,
+            username TEXT
+        )
+        """, "users base")
+
+        user_alters = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
+        ]
+        for stmt in user_alters:
+            safe_exec(stmt, "users alter")
+
+        # --- AVIATOR_ROUNDS TABLE ---
+        safe_exec("""
+        CREATE TABLE IF NOT EXISTS aviator_rounds (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT REFERENCES users(chat_id),
+            start_time TIMESTAMPTZ DEFAULT NOW()
+        )
+        """, "aviator_rounds base")
+
+        aviator_alters = [
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS bet_usd NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS crash_multiplier NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS growth_per_sec NUMERIC(18,4)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS status TEXT",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS cashout_multiplier NUMERIC(18,2)",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS cashout_time TIMESTAMPTZ",
+            "ALTER TABLE aviator_rounds ADD COLUMN IF NOT EXISTS profit_usd NUMERIC(18,2)"
+        ]
+        for stmt in aviator_alters:
+            safe_exec(stmt, "aviator_rounds alter")
+
+        # --- TRANSACTIONS TABLE ---
+        safe_exec("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT REFERENCES users(chat_id),
+            amount_usd NUMERIC(18,2),
+            amount_ngn NUMERIC(18,2),
+            type TEXT,
+            status TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """, "transactions base")
+
+        # Ensure external_ref exists
+        safe_exec("""
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS external_ref TEXT
+        """, "transactions external_ref")
+
+        # Then create index
+        safe_exec("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_ref
+        ON transactions (external_ref) WHERE external_ref IS NOT NULL
+        """, "transactions ext_ref idx")
+
+        # --- WITHDRAWAL_REQUESTS TABLE ---
+        safe_exec("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT REFERENCES users(chat_id),
+            amount_usd NUMERIC(18,2) NOT NULL,
+            amount_ngn NUMERIC(18,2) NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """, "withdrawal_requests base")
+
+run_migrations()
 
 # =========================
-# Ledger helpers
+# Balance / Ledger helpers
 # =========================
-def sync_user_balance(user: User, force_recalc: bool = False):
-    if force_recalc:
-        # Sum all approved transactions
-        rows = db.session.execute(
-            text("SELECT COALESCE(SUM(amount_usd),0) FROM transactions WHERE chat_id = :cid AND status='approved'")
-            , {"cid": user.chat_id}
-        ).scalar()
-        user.balance_usd = to_cents(Decimal(rows or 0))
-    user.balance_usd = to_cents(Decimal(user.balance_usd or 0))
-    user.balance_ngn = to_cents(Decimal(user.balance_usd) * USD_TO_NGN)
-    if user.balance_usd < 0:
-        user.balance_usd = Decimal("0.00")
-    if user.balance_ngn < 0:
-        user.balance_ngn = Decimal("0.00")
+def recalc_balance_from_ledger(user: User) -> Decimal:
+    """Sum all tx with status in ('pending','approved','completed')."""
+    rows = db.session.execute(text("""
+        SELECT COALESCE(SUM(amount_usd), 0) AS total
+        FROM transactions
+        WHERE chat_id = :chat_id
+          AND status IN ('pending','approved','completed')
+    """), {"chat_id": user.chat_id}).fetchone()
+    total = Decimal(str(rows.total or "0"))
+    user.balance_usd = to_cents(total)
+    user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
     db.session.commit()
+    return user.balance_usd
+
+def sync_user_balance(user: User, force_recalc: bool = False):
+    """Optionally recompute from ledger; otherwise just clamp >= 0."""
+    if force_recalc:
+        recalc_balance_from_ledger(user)
+    else:
+        if user.balance_usd is None or user.balance_usd < 0:
+            user.balance_usd = Decimal("0.00")
+        if user.balance_ngn is None or user.balance_ngn < 0:
+            user.balance_ngn = Decimal("0.00")
+        db.session.commit()
 
 def add_tx(user: User, t_type: str, usd: Decimal, ngn: Decimal | None = None,
            status: str = "approved", meta: dict | None = None,
-           external_ref: str | None = None, affect_balance: bool = True) -> Transaction:
+           external_ref: str | None = None, affect_balance: bool = True) -> 'Transaction':
     usd = to_cents(usd)
     ngn = to_cents(ngn) if ngn is not None else None
     tx = Transaction(
@@ -208,10 +312,9 @@ def add_tx(user: User, t_type: str, usd: Decimal, ngn: Decimal | None = None,
     db.session.add(tx)
     if affect_balance:
         user.balance_usd = to_cents(Decimal(user.balance_usd) + usd)
-        user.balance_ngn = to_cents(Decimal(user.balance_usd) * USD_TO_NGN)
+        user.balance_ngn = to_cents(user.balance_usd * USD_TO_NGN)
     db.session.commit()
     return tx
-
 
 # =========================
 # User helper
@@ -231,7 +334,7 @@ def get_or_create_user_from_query():
         username = request.args.get("username")
 
     if not chat_id:
-        abort(400, "Missing chat_id. Launch from Telegram WebApp button or append ?chat_id=.")
+        abort(400, "Missing chat_id. Launch from Telegram WebApp button or append ?chat_id=...")
 
     try:
         chat_id = int(chat_id)
@@ -248,36 +351,69 @@ def get_or_create_user_from_query():
     else:
         if user.ensure_defaults():
             db.session.commit()
+        # Optionally force-recalc: sync_user_balance(user, force_recalc=True)
 
     return user
 
+# =========================
+# Walk cap helpers
+# =========================
+BASE_DAILY_WALK_CAP_USD = Decimal("1.00")   # at level-1 (0.001 $/step)
+
+def current_walk_cap_usd(user: User) -> Decimal:
+    # Scale cap proportionally to rate (level 2 gets 2x, etc.)
+    rate = Decimal(user.walk_rate or "0.001")
+    scale = rate / Decimal("0.001")
+    cap = BASE_DAILY_WALK_CAP_USD * scale
+    return to_cents(cap)
+
+def ensure_today_walk_counter(user: User):
+    today = date.today()
+    if user.steps_credited_on != today:
+        user.steps_credited_on = today
+        user.steps_usd_today = Decimal("0.00")
+        db.session.commit()
 
 # =========================
-# API: Basics
+# Routes
 # =========================
 @app.route("/", methods=["GET", "HEAD"])
 def index():
-    if request.method == "HEAD":
-        return ("", 200)
-    if not request.args.get("chat_id"):
-        # health / landing
-        return "<h3>Tapify WebApp is running</h3>", 200
-    user = get_or_create_user_from_query()
-    return render_template_string(BASE_HTML, chat_id=user.chat_id, username=user.username or "")
+    # Health check & no chat_id landing for hosting
+    if request.method == "HEAD" or not request.args.get("chat_id"):
+        return "OK", 200
 
+    user = get_or_create_user_from_query()
+    return render_template_string(
+        BASE_HTML,
+        tap_reward=f"{TAP_REWARD}",
+        max_tap=MAX_TAP_PER_REQUEST,
+        username=user.username or user.chat_id,
+    )
+
+@app.get("/health")
+def health():
+    return {"ok": True, "time": now_utc().isoformat()}
+
+# --- Profile ---
 @app.get("/api/user")
 def api_user():
     user = get_or_create_user_from_query()
     ensure_today_walk_counter(user)
+    cap = current_walk_cap_usd(user)
+    remaining = to_cents(cap - Decimal(user.steps_usd_today or 0))
+    if remaining < 0:
+        remaining = Decimal("0.00")
     return jsonify({
-        "ok": True,
         "chat_id": user.chat_id,
         "username": user.username,
         "balance_usd": str(to_cents(user.balance_usd)),
         "balance_ngn": str(to_cents(user.balance_ngn)),
         "walk_level": user.walk_level,
-        "walk_rate": str(user.walk_rate),
-        "steps_usd_today": str(to_cents(user.steps_usd_today)),
+        "walk_rate": str(to_cents(user.walk_rate)),
+        "total_steps": int(user.total_steps or 0),
+        "walk_cap_usd_today": str(cap),
+        "walk_remaining_usd_today": str(remaining),
     })
 
 # --- Tap ---
@@ -285,150 +421,74 @@ def api_user():
 def api_tap():
     user = get_or_create_user_from_query()
     body = request.get_json(silent=True) or {}
-    count = int(body.get("count", 0))
-    if count <= 0:
-        return jsonify({"ok": False, "error": "No taps"}), 400
-    count = min(count, MAX_TAP_PER_FLUSH)
-    earned = to_cents(TAP_REWARD * Decimal(count))
-    add_tx(user, "tap_earn", usd=earned, ngn=earned * USD_TO_NGN, status="approved", meta={"count": count})
-    user.taps = (user.taps or 0) + count
-    db.session.commit()
-    return jsonify({"ok": True, "earned": str(earned), "balance_usd": str(user.balance_usd)})
+    count = int(body.get("count", 1))
+    count = max(1, min(count, MAX_TAP_PER_REQUEST))
 
-# --- Walk ---
-@app.post("/api/walk/upgrade")
-def api_walk_upgrade():
+    earn = to_cents(TAP_REWARD * Decimal(count))
+    add_tx(user, "tap", usd=earn, ngn=earn * USD_TO_NGN, status="approved", meta={"count": count})
+    return jsonify({"ok": True, "earned_usd": str(earn), "balance_usd": str(user.balance_usd), "balance_ngn": str(user.balance_ngn)})
+
+# --- Walk & Earn ---
+@app.post("/api/steps")
+def api_steps():
     user = get_or_create_user_from_query()
     body = request.get_json(silent=True) or {}
-    target = int(body.get("target_level", 1))
+    steps = int(body.get("steps", 0))
+    if steps <= 0:
+        return jsonify({"ok": False, "error": "steps must be positive"}), 400
+
+    ensure_today_walk_counter(user)
+    cap = current_walk_cap_usd(user)
+    already = Decimal(user.steps_usd_today or 0)
+    remaining_usd = to_cents(cap - already)
+    if remaining_usd <= 0:
+        return jsonify({"ok": True, "earned_usd": "0.00", "cap_reached": True, "balance_usd": str(user.balance_usd)})
+
+    earn = to_cents(Decimal(user.walk_rate) * Decimal(steps))
+    if earn > remaining_usd:
+        earn = remaining_usd
+
+    # Apply earnings
+    user.total_steps = int(user.total_steps or 0) + steps
+    user.steps_usd_today = to_cents(Decimal(user.steps_usd_today or 0) + earn)
+    db.session.commit()
+
+    add_tx(user, "walk", usd=earn, ngn=earn * USD_TO_NGN, status="approved", meta={"steps": steps, "rate": str(user.walk_rate)})
+    return jsonify({
+        "ok": True,
+        "earned_usd": str(earn),
+        "balance_usd": str(user.balance_usd),
+        "balance_ngn": str(user.balance_ngn),
+        "total_steps": int(user.total_steps),
+        "cap_reached": user.steps_usd_today >= cap
+    })
+
+@app.post("/api/upgrade")
+def api_upgrade():
+    user = get_or_create_user_from_query()
+    body = request.get_json(silent=True) or {}
+    target = int(body.get("target_level", 0))
+    if target <= user.walk_level:
+        return jsonify({"ok": False, "error": "Target must be higher than current level"}), 400
     if target not in WALK_UPGRADES:
         return jsonify({"ok": False, "error": "Invalid level"}), 400
-    if target <= (user.walk_level or 1):
-        return jsonify({"ok": False, "error": "Already at this level or higher"}), 400
-    price = WALK_UPGRADES[target]["price"]
-    if Decimal(user.balance_usd) < price:
-        return jsonify({"ok": False, "error": "Insufficient balance"}), 400
-    add_tx(user, "walk_upgrade", usd=-price, ngn=-price * USD_TO_NGN, meta={"to": target})
+
+    total_cost = Decimal("0.00")
+    for lvl in range(user.walk_level + 1, target + 1):
+        total_cost += WALK_UPGRADES[lvl]["price"]
+
+    if Decimal(user.balance_usd) < total_cost:
+        return jsonify({"ok": False, "error": "Insufficient balance", "required_usd": str(to_cents(total_cost))}), 400
+
+    # Deduct & set new level + rate
+    add_tx(user, "upgrade", usd=-to_cents(total_cost), ngn=-to_cents(total_cost * USD_TO_NGN), status="approved",
+           meta={"from": user.walk_level, "to": target, "new_rate": str(WALK_UPGRADES[target]["rate"])})
+
     user.walk_level = target
     user.walk_rate = WALK_UPGRADES[target]["rate"]
     db.session.commit()
+
     return jsonify({"ok": True, "balance_usd": str(user.balance_usd), "walk_level": user.walk_level, "walk_rate": str(user.walk_rate)})
-
-# --- Deposits (Paystack placeholder-ready) ---
-@app.post("/api/deposit")
-def api_deposit():
-    user = get_or_create_user_from_query()
-    body = request.get_json(silent=True) or {}
-    amount_ngn = Decimal(str(body.get("amount_ngn", "0")))
-    if amount_ngn < Decimal("100"):
-        return jsonify({"ok": False, "error": "Minimum deposit is ₦100"}), 400
-    # In a live environment you’d create a Paystack session and return checkout URL
-    ext_ref = f"dep_{user.chat_id}_{int(datetime.utcnow().timestamp())}"
-    # For UX continuity return a placeholder link, tx stays pending until webhook hits /api/paystack/webhook
-    tx = add_tx(user, "deposit", usd=Decimal("0.00"), ngn=amount_ngn, status="pending", meta={"gateway": "paystack"}, external_ref=ext_ref, affect_balance=False)
-    checkout_url = f"https://paystack.com/pay/{ext_ref}"
-    return jsonify({"ok": True, "checkout_url": checkout_url, "reference": ext_ref, "tx_id": tx.id})
-
-@app.post("/api/paystack/webhook")
-def paystack_webhook():
-    # Minimal stub so flow doesn't break; validate signature if PAYSTACK_SECRET_KEY present
-    raw = request.data
-    if PAYSTACK_SECRET_KEY:
-        their = request.headers.get("x-paystack-signature", "")
-        ours = hmac.new(PAYSTACK_SECRET_KEY.encode(), raw, hashlib.sha512).hexdigest()
-        if not hmac.compare_digest(their, ours):
-            return ("bad signature", 400)
-    event = request.get_json(silent=True) or {}
-    ref = (event.get("data") or {}).get("reference") or event.get("reference")
-    amount_kobo = (event.get("data") or {}).get("amount")
-    status = (event.get("data") or {}).get("status", "success")
-    if not ref:
-        return ("ok", 200)
-    tx = Transaction.query.filter_by(external_ref=ref).first()
-    if not tx:
-        return ("ok", 200)
-    if tx.status == "approved":
-        return ("ok", 200)
-    if status == "success":
-        # Convert kobo->NGN if provided; else keep existing
-        ngn = to_cents(Decimal(str(amount_kobo or 0)) / Decimal("100")) if amount_kobo else to_cents(Decimal(tx.amount_ngn or 0))
-        usd = to_cents(ngn / USD_TO_NGN)
-        tx.status = "approved"
-        tx.amount_ngn = ngn
-        tx.amount_usd = usd
-        user = User.query.get(tx.chat_id)
-        user.balance_usd = to_cents(Decimal(user.balance_usd) + usd)
-        user.balance_ngn = to_cents(Decimal(user.balance_usd) * USD_TO_NGN)
-        db.session.commit()
-    else:
-        tx.status = "failed"
-        db.session.commit()
-    return ("ok", 200)
-
-# --- Withdrawals ---
-@app.post("/api/withdraw")
-def api_withdraw():
-    user = get_or_create_user_from_query()
-    body = request.get_json(silent=True) or {}
-    amount = to_cents(Decimal(str(body.get("amount", "0"))))
-    payout = body.get("payout", "")
-    if amount <= 0:
-        return jsonify({"ok": False, "error": "Invalid amount"}), 400
-    if amount > Decimal(user.balance_usd):
-        return jsonify({"ok": False, "error": "Insufficient balance"}), 400
-    tx = add_tx(user, "withdraw", usd=-amount, ngn=-amount * USD_TO_NGN, status="pending", meta={"payout": payout})
-    return jsonify({"ok": True, "request_id": tx.id})
-
-# --- Admin actions for withdrawals ---
-@app.post("/api/admin/withdraw/approve")
-def admin_withdraw_approve():
-    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    body = request.get_json(silent=True) or {}
-    req_id = body.get("request_id")
-    tx = Transaction.query.filter_by(id=req_id, type="withdraw").first()
-    if not tx:
-        return jsonify({"ok": False, "error": "not found"}), 404
-    tx.status = "approved"
-    db.session.commit()
-    return jsonify({"ok": True, "request_id": tx.id})
-
-@app.post("/api/admin/withdraw/reject")
-def admin_withdraw_reject():
-    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    body = request.get_json(silent=True) or {}
-    req_id = body.get("request_id")
-    tx = Transaction.query.filter_by(id=req_id, type="withdraw").first()
-    if not tx:
-        return jsonify({"ok": False, "error": "not found"}), 404
-    user = User.query.get(tx.chat_id)
-    # return funds
-    user.balance_usd = to_cents(Decimal(user.balance_usd) - Decimal(tx.amount_usd or 0))
-    user.balance_ngn = to_cents(Decimal(user.balance_usd) * USD_TO_NGN)
-    tx.status = "rejected"
-    db.session.commit()
-    return jsonify({"ok": True, "message": "Withdrawal rejected & funds returned", "request_id": tx.id})
-
-# --- History ---
-@app.get("/api/transactions")
-def api_transactions():
-    user = get_or_create_user_from_query()
-    q = Transaction.query.filter_by(chat_id=user.chat_id).order_by(Transaction.id.desc()).limit(50).all()
-    return jsonify({
-        "ok": True,
-        "items": [
-            {
-                "id": t.id,
-                "type": t.type,
-                "status": t.status,
-                "amount_usd": str(to_cents(t.amount_usd)),
-                "meta": t.meta or {},
-                "ext": t.external_ref,
-                "created_at": t.created_at.isoformat(),
-            } for t in q
-        ]
-    })
 
 # --- Aviator ---
 @app.post("/api/aviator/start")
@@ -441,6 +501,7 @@ def api_aviator_start():
     if Decimal(user.balance_usd) < bet:
         return jsonify({"ok": False, "error": "Insufficient balance"}), 400
 
+    # Deduct bet via ledger
     add_tx(user, "aviator_bet", usd=-to_cents(bet), ngn=-to_cents(bet * USD_TO_NGN), status="approved", meta={})
 
     round_obj = AviatorRound(
@@ -468,7 +529,6 @@ def _aviator_state(round_obj: AviatorRound):
 def api_aviator_state():
     user = get_or_create_user_from_query()
     round_id = request.args.get("round_id")
-
     try:
         round_id = int(round_id)
     except Exception:
@@ -490,23 +550,223 @@ def api_aviator_state():
 def api_aviator_cashout():
     user = get_or_create_user_from_query()
     body = request.get_json(silent=True) or {}
-    round_id = int(body.get("round_id", 0))
+    round_id = body.get("round_id")
+    try:
+        round_id = int(round_id)
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid round id"}), 400
+
     r = AviatorRound.query.filter_by(id=round_id, chat_id=user.chat_id).first()
-    if not r or r.status != "active":
-        return jsonify({"ok": False, "error": "Round inactive"}), 400
+    if not r:
+        return jsonify({"ok": False, "error": "Round not found"}), 404
+    if r.status != "active":
+        return jsonify({"ok": False, "error": f"Round is {r.status}"}), 400
+
     mult, crashed = _aviator_state(r)
     if crashed:
         r.status = "crashed"
         db.session.commit()
-        return jsonify({"ok": False, "error": "Crashed already"}), 400
-    # Payout
-    win = to_cents(Decimal(r.bet_usd) * (mult - Decimal("1.00")))
-    add_tx(user, "aviator_win", usd=win, ngn=win * USD_TO_NGN, status="approved")
+        return jsonify({"ok": False, "error": "Crashed before cashout"}), 400
+
+    payout = to_cents(Decimal(r.bet_usd) * mult)
+    profit = to_cents(payout - Decimal(r.bet_usd))
+
+    # Credit payout via ledger
+    add_tx(user, "aviator_cashout", usd=payout, ngn=payout * USD_TO_NGN, status="approved", meta={"mult": str(mult)})
+
     r.status = "cashed"
     r.cashout_multiplier = mult
+    r.cashout_time = now_utc()
+    r.profit_usd = profit
     db.session.commit()
-    return jsonify({"ok": True, "win": str(win), "multiplier": str(mult), "balance_usd": str(user.balance_usd)})
 
+    return jsonify({"ok": True, "payout_usd": str(payout), "multiplier": str(mult), "balance_usd": str(user.balance_usd), "balance_ngn": str(user.balance_ngn)})
+
+# --- Deposits (Paystack) ---
+@app.post("/api/deposit")
+def api_deposit_create():
+    if not PAYSTACK_SECRET_KEY:
+        abort(400, "Paystack not configured (missing PAYSTACK_SECRET_KEY)")
+
+    user = get_or_create_user_from_query()
+    body = request.get_json(silent=True) or {}
+    # Client sends NGN amount (string/number)
+    amount_ngn = Decimal(str(body.get("amount_ngn", "0")))
+    if amount_ngn < MIN_DEPOSIT_NGN:
+        return jsonify({"ok": False, "error": f"Minimum deposit is ₦{MIN_DEPOSIT_NGN}"}), 400
+
+    payload = {
+        "email": f"{user.username or user.chat_id}@tapify.local",
+        "amount": int(to_cents(amount_ngn) * 100),  # kobo
+        "metadata": {"chat_id": user.chat_id}
+    }
+    headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
+    r = requests.post("https://api.paystack.co/transaction/initialize", json=payload, headers=headers, timeout=30)
+    res = r.json()
+
+    if not res.get("status"):
+        abort(500, res.get("message", "Paystack init failed"))
+
+    # Client should open this URL to pay
+    auth_url = res["data"]["authorization_url"]
+    reference = res["data"]["reference"]
+
+    # Optional: record a pending tx (NOT affecting balance) – useful for audit
+    add_tx(user, "deposit", usd=Decimal("0.00"), ngn=amount_ngn, status="pending",
+           meta={"init_ref": reference}, external_ref=None, affect_balance=False)
+
+    return jsonify({"ok": True, "checkout_url": auth_url, "reference": reference})
+
+@app.post("/api/webhook/paystack")
+def paystack_webhook():
+    # Verify signature
+    raw = request.get_data()
+    signature = request.headers.get("x-paystack-signature")
+    if not paystack_signature_valid(raw, signature):
+        abort(403, "Invalid signature")
+
+    payload = request.get_json(silent=True) or {}
+    event = payload.get("event")
+    data = payload.get("data", {})
+
+    if event == "charge.success":
+        # Unique reference to prevent double-credit
+        reference = data.get("reference")
+        # If we've already processed this reference, ignore
+        existing = Transaction.query.filter_by(external_ref=reference).first()
+        if existing:
+            return "OK", 200
+
+        meta = data.get("metadata") or {}
+        chat_id = meta.get("chat_id")
+        user = User.query.get(chat_id)
+        if not user:
+            # If user not found, do nothing (or log)
+            return "OK", 200
+
+        amount_kobo = Decimal(str(data.get("amount", "0")))
+        amount_ngn = to_cents(amount_kobo / Decimal("100"))
+        usd = to_cents(amount_ngn / USD_TO_NGN)
+
+        # Finalize deposit: credit balance & write ledger with external_ref
+        add_tx(user, "deposit", usd=usd, ngn=amount_ngn, status="completed",
+               meta={"paystack_id": data.get("id")}, external_ref=reference, affect_balance=True)
+
+    return "OK", 200
+
+# --- Withdrawals ---
+@app.post("/api/withdraw")
+def api_withdraw_request():
+    user = get_or_create_user_from_query()
+    body = request.get_json(silent=True) or {}
+    amount_usd = Decimal(str(body.get("amount", "0")))
+    payout = (body.get("payout") or "").strip()  # bank/wallet info
+
+    if amount_usd < MIN_WITHDRAW_USD:
+        return jsonify({"ok": False, "error": f"Minimum withdraw is ${MIN_WITHDRAW_USD}"}), 400
+    if Decimal(user.balance_usd) < amount_usd:
+        return jsonify({"ok": False, "error": "Insufficient balance"}), 400
+
+    # Hold funds immediately
+    hold = to_cents(amount_usd)
+    add_tx(user, "withdraw", usd=-hold, ngn=-to_cents(hold * USD_TO_NGN),
+           status="pending", meta={"payout": payout})
+
+    req = WithdrawalRequest(
+        chat_id=user.chat_id,
+        amount_usd=hold,
+        amount_ngn=to_cents(hold * USD_TO_NGN),
+        status="pending"
+    )
+    db.session.add(req)
+    db.session.commit()
+
+    return jsonify({"ok": True, "message": "Withdrawal requested. Awaiting admin approval.", "request_id": req.id, "balance_usd": str(user.balance_usd)})
+
+@app.post("/api/admin/withdraw/approve")
+def admin_withdraw_approve():
+    require_admin()
+    body = request.get_json(silent=True) or {}
+    req_id = body.get("request_id")
+    req = WithdrawalRequest.query.get(req_id)
+    if not req or req.status != "pending":
+        abort(400, "Invalid request")
+
+    user = User.query.get(req.chat_id)
+    if not user:
+        abort(400, "User not found")
+
+    req.status = "approved"
+    # Mark the matching pending tx as approved (no extra balance change)
+    db.session.execute(text("""
+        UPDATE transactions
+           SET status = 'approved'
+         WHERE chat_id = :chat_id
+           AND type = 'withdraw'
+           AND status = 'pending'
+           AND amount_usd = :neg_amount
+         ORDER BY id DESC
+         LIMIT 1
+    """), {"chat_id": user.chat_id, "neg_amount": -to_cents(req.amount_usd)})
+    db.session.commit()
+
+    return jsonify({"ok": True, "message": "Withdrawal approved", "request_id": req.id})
+
+@app.post("/api/admin/withdraw/reject")
+def admin_withdraw_reject():
+    require_admin()
+    body = request.get_json(silent=True) or {}
+    req_id = body.get("request_id")
+    reason = (body.get("reason") or "").strip()
+    req = WithdrawalRequest.query.get(req_id)
+    if not req or req.status != "pending":
+        abort(400, "Invalid request")
+
+    user = User.query.get(req.chat_id)
+    if not user:
+        abort(400, "User not found")
+
+    # Refund the held amount
+    add_tx(user, "withdraw_revert", usd=to_cents(req.amount_usd),
+           ngn=to_cents(req.amount_usd * USD_TO_NGN), status="approved",
+           meta={"request_id": req_id, "reason": reason})
+
+    # Mark the original pending withdraw tx rejected
+    db.session.execute(text("""
+        UPDATE transactions
+           SET status = 'rejected'
+         WHERE chat_id = :chat_id
+           AND type = 'withdraw'
+           AND status = 'pending'
+           AND amount_usd = :neg_amount
+         ORDER BY id DESC
+         LIMIT 1
+    """), {"chat_id": user.chat_id, "neg_amount": -to_cents(req.amount_usd)})
+
+    req.status = "rejected"
+    db.session.commit()
+
+    return jsonify({"ok": True, "message": "Withdrawal rejected & funds returned", "request_id": req.id})
+
+# --- History ---
+@app.get("/api/transactions")
+def api_transactions():
+    user = get_or_create_user_from_query()
+    q = Transaction.query.filter_by(chat_id=user.chat_id).order_by(Transaction.id.desc()).limit(50).all()
+    return jsonify({
+        "ok": True,
+        "items": [
+            {
+                "id": t.id,
+                "type": t.type,
+                "status": t.status,
+                "amount_usd": str(to_cents(t.amount_usd)),
+                "meta": t.meta or {},
+                "ext": t.external_ref,
+                "created_at": t.created_at.isoformat(),
+            } for t in q
+        ]
+    }
 
 # =========================
 # UI (Tailwind single-file) — with requested fixes
