@@ -1,12 +1,11 @@
-#Web edit version....
-
+# Full single-file Flask app with persistent energy + server-side tap and aviator backend
 import os
 import json
 import hmac
 import hashlib
 import random
 import requests
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN, getcontext
 
 from flask import Flask, request, jsonify, render_template_string, abort
@@ -48,6 +47,11 @@ MAX_BET = Decimal("1000000.00")    # USD
 # Wallet
 MIN_DEPOSIT_NGN = Decimal("100.00")   # ₦ minimum deposit
 MIN_WITHDRAW_USD = Decimal("50.00")   # $ minimum withdrawal
+
+# Energy defaults (persistent)
+DEFAULT_ENERGY_MAX = 100
+# 1 energy per 5 seconds -> 0.2 energy/sec
+DEFAULT_ENERGY_REGEN_PER_SEC = Decimal("0.2")
 
 # =========================
 # Utils
@@ -114,6 +118,12 @@ class User(db.Model):
     steps_credited_on = db.Column(db.Date)
     steps_usd_today   = db.Column(db.Numeric(18, 2), default=Decimal("0.00"))
 
+    # --- Persistent energy fields ---
+    energy = db.Column(db.Integer, default=DEFAULT_ENERGY_MAX)
+    energy_max = db.Column(db.Integer, default=DEFAULT_ENERGY_MAX)
+    energy_regen_per_sec = db.Column(db.Numeric(18, 6), default=DEFAULT_ENERGY_REGEN_PER_SEC)
+    last_energy_update = db.Column(db.DateTime(timezone=True), default=now_utc)
+
     created_at = db.Column(db.DateTime(timezone=True), default=now_utc)
 
     def ensure_defaults(self):
@@ -132,6 +142,14 @@ class User(db.Model):
             self.steps_credited_on = date.today(); changed = True
         if self.steps_usd_today is None:
             self.steps_usd_today = Decimal("0.00"); changed = True
+        if self.energy is None:
+            self.energy = DEFAULT_ENERGY_MAX; changed = True
+        if self.energy_max is None:
+            self.energy_max = DEFAULT_ENERGY_MAX; changed = True
+        if self.energy_regen_per_sec is None:
+            self.energy_regen_per_sec = DEFAULT_ENERGY_REGEN_PER_SEC; changed = True
+        if self.last_energy_update is None:
+            self.last_energy_update = now_utc(); changed = True
         return changed
 
 
@@ -189,7 +207,7 @@ def run_migrations():
             print(f"Migration warning ({label}):", e)
 
     with app.app_context():
-        # --- USERS TABLE ---
+        # --- USERS TABLE base ---
         safe_exec("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id BIGINT PRIMARY KEY,
@@ -201,9 +219,16 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_usd NUMERIC(18,2) DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance_ngn NUMERIC(18,2) DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_level INT DEFAULT 1",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.01",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS walk_rate NUMERIC(18,4) DEFAULT 0.001",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_steps BIGINT DEFAULT 0",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS steps_credited_on DATE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS steps_usd_today NUMERIC(18,2) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+            # energy columns
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS energy INT DEFAULT {DEFAULT_ENERGY_MAX}",
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS energy_max INT DEFAULT {DEFAULT_ENERGY_MAX}",
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS energy_regen_per_sec NUMERIC(18,6) DEFAULT {DEFAULT_ENERGY_REGEN_PER_SEC}",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_energy_update TIMESTAMPTZ DEFAULT NOW()"
         ]
         for stmt in user_alters:
             safe_exec(stmt, "users alter")
@@ -317,6 +342,47 @@ def add_tx(user: User, t_type: str, usd: Decimal, ngn: Decimal | None = None,
     return tx
 
 # =========================
+# Energy helpers (persistent server-side)
+# =========================
+def recharge_energy(user: User) -> None:
+    """
+    Calculate energy to add since last_energy_update based on energy_regen_per_sec.
+    Updates user.energy and user.last_energy_update (commits).
+    """
+    try:
+        if user.energy is None:
+            user.energy = DEFAULT_ENERGY_MAX
+        if user.energy_max is None:
+            user.energy_max = DEFAULT_ENERGY_MAX
+        if user.energy_regen_per_sec is None:
+            user.energy_regen_per_sec = DEFAULT_ENERGY_REGEN_PER_SEC
+        if user.last_energy_update is None:
+            user.last_energy_update = now_utc()
+
+        now = now_utc()
+        elapsed = (now - user.last_energy_update).total_seconds()
+        if elapsed <= 0:
+            return
+
+        regen_per_sec = float(user.energy_regen_per_sec)
+        # compute gained energy as integer units
+        gained = int(elapsed * regen_per_sec)
+        if gained <= 0:
+            # no whole units yet
+            return
+
+        new_energy = min(int(user.energy_max), int(user.energy) + gained)
+        user.energy = new_energy
+        # advance last_energy_update by the amount of seconds that produced those gained units
+        # avoid tiny fractional drift by snapping to now
+        user.last_energy_update = now
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        # don't crash the app for energy calc issues
+        print("recharge_energy error:", e)
+
+# =========================
 # User helper
 # =========================
 def get_or_create_user_from_query():
@@ -351,7 +417,8 @@ def get_or_create_user_from_query():
     else:
         if user.ensure_defaults():
             db.session.commit()
-        # Optionally force-recalc: sync_user_balance(user, force_recalc=True)
+        # ensure we bring energy up-to-date
+        recharge_energy(user)
 
     return user
 
@@ -395,11 +462,13 @@ def index():
 def health():
     return {"ok": True, "time": now_utc().isoformat()}
 
-# --- Profile ---
+# --- Profile / State ---
 @app.get("/api/user")
 def api_user():
     user = get_or_create_user_from_query()
     ensure_today_walk_counter(user)
+    # ensure energy up to date
+    recharge_energy(user)
     cap = current_walk_cap_usd(user)
     remaining = to_cents(cap - Decimal(user.steps_usd_today or 0))
     if remaining < 0:
@@ -414,19 +483,46 @@ def api_user():
         "total_steps": int(user.total_steps or 0),
         "walk_cap_usd_today": str(cap),
         "walk_remaining_usd_today": str(remaining),
+        # energy state
+        "energy": int(user.energy or 0),
+        "energy_max": int(user.energy_max or DEFAULT_ENERGY_MAX),
+        "energy_regen_per_sec": str(user.energy_regen_per_sec or DEFAULT_ENERGY_REGEN_PER_SEC),
+        "last_energy_update": user.last_energy_update.isoformat() if user.last_energy_update else None,
     })
 
-# --- Tap ---
+# --- Server-side Tap (persistent) ---
 @app.post("/api/tap")
 def api_tap():
     user = get_or_create_user_from_query()
+    # bring energy up to date
+    recharge_energy(user)
+
     body = request.get_json(silent=True) or {}
     count = int(body.get("count", 1))
     count = max(1, min(count, MAX_TAP_PER_REQUEST))
 
+    # each tap consumes 1 energy; adjust if you want taps to cost more
+    energy_needed = count
+    if int(user.energy or 0) < energy_needed:
+        return jsonify({"ok": False, "error": "Not enough energy", "energy": int(user.energy or 0)}), 400
+
+    # consume energy
+    user.energy = int(user.energy) - energy_needed
+    user.last_energy_update = now_utc()
+    db.session.commit()
+
+    # reward
     earn = to_cents(TAP_REWARD * Decimal(count))
     add_tx(user, "tap", usd=earn, ngn=earn * USD_TO_NGN, status="approved", meta={"count": count})
-    return jsonify({"ok": True, "earned_usd": str(earn), "balance_usd": str(user.balance_usd), "balance_ngn": str(user.balance_ngn)})
+
+    return jsonify({
+        "ok": True,
+        "earned_usd": str(earn),
+        "balance_usd": str(user.balance_usd),
+        "balance_ngn": str(user.balance_ngn),
+        "energy": int(user.energy),
+        "energy_max": int(user.energy_max),
+    })
 
 # --- Walk & Earn ---
 @app.post("/api/steps")
@@ -486,9 +582,13 @@ def api_upgrade():
 
     user.walk_level = target
     user.walk_rate = WALK_UPGRADES[target]["rate"]
+    # Optionally: increase energy regen with level (example mapping)
+    # You can customize this mapping as desired. For now: each level increases regen by 20%
+    base_regen = float(DEFAULT_ENERGY_REGEN_PER_SEC)
+    user.energy_regen_per_sec = Decimal(str(base_regen * (1 + 0.2 * (user.walk_level - 1))))
     db.session.commit()
 
-    return jsonify({"ok": True, "balance_usd": str(user.balance_usd), "walk_level": user.walk_level, "walk_rate": str(user.walk_rate)})
+    return jsonify({"ok": True, "balance_usd": str(user.balance_usd), "walk_level": user.walk_level, "walk_rate": str(user.walk_rate), "energy_regen_per_sec": str(user.energy_regen_per_sec)})
 
 # --- Aviator ---
 @app.post("/api/aviator/start")
@@ -769,7 +869,7 @@ def api_transactions():
     })
 
 # =========================
-# UI (Tailwind single-file) — with requested fixes
+# UI (Tailwind single-file) — with persistent tap wiring
 # =========================
 BASE_HTML = """
 <!doctype html>
@@ -785,8 +885,7 @@ BASE_HTML = """
     tailwind.config = {
       theme: { extend: { boxShadow: { 'soft': '0 10px 30px rgba(0,0,0,0.20)' } } }
     }
-    const tg = window.Telegram.WebApp;
-    tg.expand();
+    try { if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.expand) window.Telegram.WebApp.expand(); } catch(e){}
   </script>
   <style>
     body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial; }
@@ -829,7 +928,7 @@ BASE_HTML = """
     @keyframes coinPulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.04)} }
     @keyframes coinBounce { 0%{transform:scale(1)} 50%{transform:scale(0.95) translateY(2px)} 100%{transform:scale(1)} }
 
-    .floatText { position: absolute; left: 0; top: 0; transform: translate(-50%,-50%); font-size: 16px; font-weight: 800; color: #fff; pointer-events: none; text-shadow: 0 2px 8px rgba(0,0,0,0.45); animation: floatUp 800ms ease forwards; z-index: 5; }
+    .floatText { position: absolute; left: 0; top: 0; transform: translate(-50%,-50%); font-size: 16px; font-weight: 800; color: #fff; pointer-events: none; text-shadow: 0 2px 8px rgba(0,0,0,0.45); animation: floatUp 800ms ease forwards; z-index: 50; }
     @keyframes floatUp { 0%{transform:translateY(0);opacity:1} 100%{transform:translateY(-40px);opacity:0} }
 
     .energy-wrap { position: relative; height: 14px; border-radius: 9999px; background: rgba(0,0,0,0.35); overflow: hidden; }
@@ -878,7 +977,6 @@ BASE_HTML = """
         <div id="energyLabel" class="text-xs text-white/70">0/0</div>
       </div>
       <div class="grid place-items-center py-2">
-        <!-- ✅ Fixed: coin image loads directly -->
         <img id="coin_img" src="https://raw.githubusercontent.com/LR-TechX/Tapify/main/tapcoin.png" alt="Tapcoin"/>
       </div>
       <div class="text-center text-white/70 text-xs">Tap the coin to earn</div>
@@ -951,7 +1049,7 @@ BASE_HTML = """
   </nav>
 
   <script>
-    // ✅ Fixed: raw.githubusercontent link for background
+    // raw.githubusercontent background
     document.body.style.backgroundImage = "url('https://raw.githubusercontent.com/LR-TechX/Tapify/main/red-waves.png')";
 
     const CHAT_ID = "{{ chat_id }}";
@@ -973,8 +1071,261 @@ BASE_HTML = """
     document.getElementById('tab_walk').onclick = ()=>showPanel('walk');
     document.getElementById('tab_wallet').onclick = ()=>showPanel('wallet');
 
-    // === Rest of your full JS logic here (fetchUser, tap, aviator, wallet, etc.) ===
-    fetchUser(); loadHistory(); showPanel('tap');
+    // === Persistent-state wiring ===
+    const coin = document.getElementById('coin_img');
+    const energyFill = document.getElementById('energyFill');
+    const energyLabel = document.getElementById('energyLabel');
+    const usdEl = document.getElementById('usd');
+    const ngnEl = document.getElementById('ngn');
+    const walkLevelEl = document.getElementById('walk_level');
+    const walkRateEl = document.getElementById('walk_rate');
+
+    let clientState = {
+      energy: 0,
+      energy_max: 100,
+      energy_regen_per_sec: 0.2,
+      balance_usd: 0,
+      balance_ngn: 0
+    };
+
+    function renderState(){
+      const pct = Math.max(0, Math.min(100, (clientState.energy / clientState.energy_max) * 100));
+      energyFill.style.width = pct + '%';
+      energyLabel.textContent = `${clientState.energy}/${clientState.energy_max}`;
+      usdEl.textContent = `$${Number(clientState.balance_usd).toFixed(2)}`;
+      ngnEl.textContent = `₦${Number(clientState.balance_ngn).toLocaleString()}`;
+      walkLevelEl.textContent = clientState.walk_level || 1;
+      walkRateEl.textContent = clientState.walk_rate || "0.001";
+    }
+
+    async function fetchState(){
+      try {
+        const r = await fetch(`/api/user?chat_id=${encodeURIComponent(CHAT_ID)}`);
+        const j = await r.json();
+        if (!j.ok && j.ok !== undefined) return;
+        // Map fields
+        clientState.energy = Number(j.energy || 0);
+        clientState.energy_max = Number(j.energy_max || 100);
+        clientState.energy_regen_per_sec = Number(j.energy_regen_per_sec || 0.2);
+        clientState.balance_usd = Number(j.balance_usd || 0);
+        clientState.balance_ngn = Number(j.balance_ngn || 0);
+        clientState.walk_level = j.walk_level || 1;
+        clientState.walk_rate = j.walk_rate || "0.001";
+        renderState();
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // Tap handler (client triggers server)
+    coin.addEventListener('click', async (e)=>{
+      try {
+        const r = await fetch(`/api/tap?chat_id=${encodeURIComponent(CHAT_ID)}`, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ count: 1 })
+        });
+        const j = await r.json();
+        if (!j.ok) {
+          if (j.error) alert(j.error);
+          return;
+        }
+
+        // animate coin & show float text
+        coin.classList.add('bounce');
+        setTimeout(()=>coin.classList.remove('bounce'), 240);
+        spawnFloat(e.clientX, e.clientY, '+' + (+j.earned_usd).toFixed(3) + '$');
+
+        // update local state from server response
+        clientState.energy = Number(j.energy || clientState.energy);
+        clientState.balance_usd = Number(j.balance_usd || clientState.balance_usd);
+        clientState.balance_ngn = Number(j.balance_ngn || clientState.balance_ngn);
+        renderState();
+      } catch (e) {
+        console.error(e);
+      }
+    });
+
+    function spawnFloat(x, y, text) {
+      const el = document.createElement('div');
+      el.className = 'floatText';
+      el.textContent = text;
+      el.style.left = x + 'px';
+      el.style.top = y + 'px';
+      document.body.appendChild(el);
+      setTimeout(()=>el.remove(), 820);
+    }
+
+    // Poll server state occasionally (keeps energy in sync)
+    setInterval(fetchState, 5000); // every 5s
+    // initial fetch
+    fetchState();
+
+    // ==== Aviator frontend minimal wiring (keeps working with backend) ====
+    let currentRoundId = null;
+    let aviatorTimer = null;
+    const betInput = document.getElementById('bet_input');
+    const betBtn = document.getElementById('bet_btn');
+    const multText = document.getElementById('mult_text');
+    const statusText = document.getElementById('status_text');
+    const cashoutBtn = document.getElementById('cashout_btn');
+    const plane = document.getElementById('plane');
+    const histBox = document.getElementById('aviator_hist');
+
+    const lastResults = [];
+    function addHistory(mult){
+      lastResults.unshift(parseFloat(mult));
+      if (lastResults.length > 20) lastResults.pop();
+      histBox.innerHTML = '';
+      for (const m of lastResults){
+        const tag = document.createElement('span');
+        tag.className = 'px-2 py-1 rounded-lg bg-white/10';
+        tag.textContent = m.toFixed(2) + '×';
+        histBox.appendChild(tag);
+      }
+    }
+
+    function startAviatorUI(){
+      statusText.textContent = 'Flying…';
+      plane.classList.remove('crash');
+      plane.classList.add('fly');
+      cashoutBtn.disabled = false;
+    }
+
+    function stopAviatorUI(crashed){
+      plane.classList.remove('fly');
+      if (crashed){
+        plane.classList.add('crash');
+        statusText.textContent = 'Crashed';
+      } else {
+        statusText.textContent = 'Cashed out';
+      }
+      cashoutBtn.disabled = true;
+    }
+
+    async function pollRound(){
+      if (!currentRoundId) return;
+      try {
+        const r = await fetch(`/api/aviator/state?chat_id=${encodeURIComponent(CHAT_ID)}&round_id=${currentRoundId}`);
+        const j = await r.json();
+        if (!j.ok) return;
+        multText.textContent = (parseFloat(j.current_multiplier||"1.00")).toFixed(2) + '×';
+        if (j.status === 'crashed'){
+          addHistory(parseFloat(j.current_multiplier));
+          stopAviatorUI(true);
+          clearInterval(aviatorTimer); aviatorTimer = null; currentRoundId = null;
+          // refresh balances
+          fetchState();
+        }
+      } catch (e) {
+        // ignore transient errors
+      }
+    }
+
+    betBtn.onclick = async ()=>{
+      const bet = parseFloat(betInput.value || '0');
+      if (!bet || bet < 0.10) { alert('Min bet is $0.10'); return; }
+      try {
+        const r = await fetch(`/api/aviator/start?chat_id=${encodeURIComponent(CHAT_ID)}`, {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ bet })
+        });
+        const j = await r.json();
+        if (!j.ok){ alert(j.error||'Error'); return; }
+        currentRoundId = j.round_id;
+        startAviatorUI();
+        if (aviatorTimer) clearInterval(aviatorTimer);
+        aviatorTimer = setInterval(pollRound, 400);
+      } catch (e) {
+        console.error(e);
+      }
+    };
+
+    cashoutBtn.onclick = async ()=>{
+      if (!currentRoundId) return;
+      try {
+        const r = await fetch(`/api/aviator/cashout?chat_id=${encodeURIComponent(CHAT_ID)}`, {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ round_id: currentRoundId })
+        });
+        const j = await r.json();
+        if (!j.ok){ alert(j.error||'Error'); return; }
+        addHistory(parseFloat(j.multiplier||"1.00"));
+        stopAviatorUI(false);
+        clearInterval(aviatorTimer); aviatorTimer = null; currentRoundId = null;
+        fetchState();
+      } catch (e) {
+        console.error(e);
+      }
+    };
+
+    // Walk upgrade wiring
+    document.getElementById('upgrade_btn').onclick = async ()=>{
+      const target = parseInt(document.getElementById('upgrade_target').value, 10);
+      const r = await fetch(`/api/upgrade?chat_id=${encodeURIComponent(CHAT_ID)}`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ target_level: target })
+      });
+      const j = await r.json();
+      if(!j.ok){ alert(j.error||'Error'); return; }
+      // refresh state
+      await fetchState();
+      alert('Upgrade successful');
+    };
+
+    // Deposit / withdraw wiring (unchanged)
+    document.getElementById('dep_btn').onclick = async ()=>{
+      const amount_ngn = parseFloat(document.getElementById('dep_amount_ngn').value||'0');
+      if (!amount_ngn || amount_ngn < 100) { alert('Minimum deposit is ₦100'); return; }
+      const r = await fetch(`/api/deposit?chat_id=${encodeURIComponent(CHAT_ID)}`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ amount_ngn })
+      });
+      const j = await r.json();
+      if(!j.ok){ alert(j.error||'Deposit init failed'); return; }
+      window.open(j.checkout_url, '_blank');
+    };
+
+    document.getElementById('wd_btn').onclick = async ()=>{
+      const amount = parseFloat(document.getElementById('wd_amount').value||'0').toFixed(2);
+      const payout = document.getElementById('wd_payout').value||'';
+      const r = await fetch(`/api/withdraw?chat_id=${encodeURIComponent(CHAT_ID)}`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ amount, payout })
+      });
+      const j = await r.json();
+      if(!j.ok){ alert(j.error||'Error'); return; }
+      alert(`Withdrawal requested. Ticket #${j.request_id}`);
+      fetchState();
+    };
+
+    // Transactions history load
+    async function loadHistory(){
+      try {
+        const r = await fetch(`/api/transactions?chat_id=${encodeURIComponent(CHAT_ID)}`);
+        const j = await r.json();
+        if(!j.ok) return;
+        const box = document.getElementById('tx_box');
+        box.innerHTML = '';
+        for (const t of j.items){
+          const amt = Number(t.amount_usd).toFixed(2);
+          const row = document.createElement('div');
+          row.className = 'p-2 rounded-lg bg-white/5 flex items-center justify-between';
+          row.innerHTML = `
+            <div class="text-xs">
+              <div class="font-semibold">${t.type}</div>
+              <div class="text-white/60">${new Date(t.created_at).toLocaleString()}</div>
+            </div>
+            <div class="text-right">
+              <div class="font-bold ${parseFloat(amt)>=0?'text-emerald-200':'text-rose-200'}">${amt}</div>
+              <div class="text-xs text-white/60">${t.status}</div>
+            </div>`;
+          box.appendChild(row);
+        }
+      } catch(e){}
+    }
+
+    // init
+    (function boot(){
+      fetchState();
+      loadHistory();
+      showPanel('tap');
+    })();
   </script>
 </body>
 </html>
