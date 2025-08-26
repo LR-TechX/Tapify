@@ -766,7 +766,7 @@ def api_transactions():
                 "created_at": t.created_at.isoformat(),
             } for t in q
         ]
-    }
+    })
 
 # =========================
 # UI (Tailwind single-file) — with requested fixes
