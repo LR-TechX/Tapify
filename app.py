@@ -878,7 +878,7 @@ BASE_HTML = """
         <div id="energyLabel" class="text-xs text-white/70">0/0</div>
       </div>
       <div class="grid place-items-center py-2">
-        <img id="coin_img" src="https://raw.githubusercontent.com/lr-techx/tapify/main/tree/tapcoin.png" alt="Tapcoin"/>
+        <img id="coin_img" src="https://github.com/LR-TechX/Tapify/blob/main/tapcoin.png" alt="Tapcoin"/>
       </div>
       <div class="text-center text-white/70 text-xs">Tap the coin to earn</div>
     </section>
@@ -950,7 +950,7 @@ BASE_HTML = """
   </nav>
 
   <script>
-    document.body.style.backgroundImage = "url('https://raw.githubusercontent.com/lr-techx/tapify/main/tree/red-waves.png')";
+    document.body.style.backgroundImage = "url('https://github.com/LR-TechX/Tapify/blob/main/red-waves.png')";
 
     const CHAT_ID = "{{ chat_id }}";
     const NAME = "{{ username }}";
