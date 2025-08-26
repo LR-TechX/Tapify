@@ -795,7 +795,7 @@ BASE_HTML = """
       margin: 0;
       overflow: hidden;
       position: relative;
-      background-color: #111;  /* fallback */
+      background-color: #111; /* fallback solid color */
       background-size: cover;
       background-position: center;
       background-repeat: no-repeat;
@@ -878,7 +878,8 @@ BASE_HTML = """
         <div id="energyLabel" class="text-xs text-white/70">0/0</div>
       </div>
       <div class="grid place-items-center py-2">
-        <img id="coin_img" src="https://raw.githubusercontent.com/LR-TechX/Tapify/blob/main/tapcoin.png" alt="Tapcoin"/>
+        <!-- ✅ Fixed: coin image loads directly -->
+        <img id="coin_img" src="https://raw.githubusercontent.com/LR-TechX/Tapify/main/tapcoin.png" alt="Tapcoin"/>
       </div>
       <div class="text-center text-white/70 text-xs">Tap the coin to earn</div>
     </section>
@@ -950,7 +951,8 @@ BASE_HTML = """
   </nav>
 
   <script>
-    document.body.style.backgroundImage = "url('https://raw.githubusercontent.com/LR-TechX/Tapify/blob/main/red-waves.png')";
+    // ✅ Fixed: raw.githubusercontent link for background
+    document.body.style.backgroundImage = "url('https://raw.githubusercontent.com/LR-TechX/Tapify/main/red-waves.png')";
 
     const CHAT_ID = "{{ chat_id }}";
     const NAME = "{{ username }}";
@@ -972,7 +974,6 @@ BASE_HTML = """
     document.getElementById('tab_wallet').onclick = ()=>showPanel('wallet');
 
     // === Rest of your full JS logic here (fetchUser, tap, aviator, wallet, etc.) ===
-    // (Keep exactly as in your current working version)
     fetchUser(); loadHistory(); showPanel('tap');
   </script>
 </body>
